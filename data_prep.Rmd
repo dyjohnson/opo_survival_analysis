@@ -1,0 +1,1252 @@
+---
+title: "Data Preparation: Eligible and Matched Cohorts for Multi-Organ Survival Analysis"
+author: "Daniel Y. Johnson"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r global_options, include=FALSE}
+library(knitr)
+opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE,
+               tidy.opts = list(width.cutoff = 60))
+```
+
+# Overview
+
+This file assembles the four organ-specific survival_benefit_<organ>_2022.Rmd analysis files. It runs the full pipeline:
+
+1. Load SRTR SAF data once for all four organs.
+2. Build a per-organ analytic dataset (one row per adult HR/LU/LI/KI candidate
+   listed during the Pre-Policy or Post-Policy window).
+3. Apply **global** exclusions with per-step counts:
+   (a) multi-organ candidate or recipient,
+   (b) inactive at listing & never active,
+   (c) data-entry errors.
+4. Split each organ frame into Pre-Policy and Post-Policy cohorts.
+5. Apply **per-organ** exclusions: (e) low-volume transplant center,
+   (f) missing matching covariates. Print totals across organs.
+6. Match 1:1 with propensity-score + Mahalanobis nearest-neighbor, with a
+   per-(organ, period) random seed derived from a base seed of 20210930 so
+   each matchit call is independently reproducible.
+7. Write `cohort_<organ>.rds` and `matched_<organ>.rds` to repo root, each
+   stacked Pre+Post in a `cohort` column. `tx_date` is included so downstream
+   chunks (cumulative incidence, sensitivity analyses) don't reload SAS.
+
+Each `survival_benefit_<organ>_2022.Rmd` should start with a single load chunk
+that reads these RDS files and runs a schema check; it does not need to
+load any SAS data.
+
+```{r packages, cache=FALSE}
+library(haven)
+library(tidyverse)
+library(MatchIt)
+```
+
+```{r helpers}
+comma <- function(x) format(x, digits = 3, big.mark = ",")
+```
+
+# Cohort windows
+
+```{r cohort_dates}
+c1_start <- as.Date("2019-08-01")
+c1_end   <- as.Date("2021-07-31")
+
+c2_start <- as.Date("2022-08-01")
+c2_end   <- as.Date("2024-07-31")
+```
+
+# Data import (once, for all organs)
+
+```{r data_load}
+data_path <- "/Users/danieljohnson/Library/CloudStorage/Box-Box/Q1 2026 SAF/pubsaf2603/"
+
+cand_thor <- read_sas(paste0(data_path, "cand_thor.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels()
+cand_liin <- read_sas(paste0(data_path, "cand_liin.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels()
+cand_kipa <- read_sas(paste0(data_path, "cand_kipa.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels()
+
+tx_hr <- read_sas(paste0(data_path, "tx_hr.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels()
+tx_li <- read_sas(paste0(data_path, "tx_li.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels()
+tx_lu <- read_sas(paste0(data_path, "tx_lu.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels()
+tx_ki <- read_sas(paste0(data_path, "tx_ki.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels()
+
+institution <- read_sas(paste0(data_path, "institution.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels()
+hist_opo_txc <- read_sas(paste0(data_path, "hist_opo_txc.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels()
+
+opo_tiers <- read_csv("opo_tiers.csv", show_col_types = FALSE) %>%
+  rename(opo_cd = `OPO Code`) %>%
+  select(opo_cd, tier19)
+```
+
+```{r lookup_tables}
+# OPTN region derived from INSTITUTION via listing center code.
+region_lookup <- institution %>%
+  filter(!is.na(REGION), !is.na(CTR_CD)) %>%
+  select(CTR_CD, REGION) %>%
+  distinct(CTR_CD, .keep_all = TRUE)
+
+# 2019 tier (per opo_tiers.csv) joined via center -> OPO -> tier.
+tier_lookup <- hist_opo_txc %>%
+  filter(TXC_CTR_TY == "TX1", SERVED_OPO_TY == "OP1",
+         END_DT >= as.Date("2019-08-01")) %>%
+  arrange(TXC_CTR_CD, desc(START_DT)) %>%
+  group_by(TXC_CTR_CD) %>% slice(1) %>% ungroup() %>%
+  select(CTR_CD = TXC_CTR_CD, opo_cd = SERVED_OPO_CD) %>%
+  left_join(opo_tiers, by = "opo_cd") %>%
+  select(CTR_CD, tier19)
+
+remove(institution, hist_opo_txc, opo_tiers)
+```
+
+# Multi-organ candidates (global flag)
+
+```{r multi_organ_global}
+# A candidate is multi-organ if either:
+#   (a) any of their listings has a multi-organ WL_ORG code (HL = heart-lung,
+#       KP = kidney-pancreas; these are the only multi-organ codes present in
+#       the Pre/Post-window data), or
+#   (b) they have multiple distinct WL_ORG listings across cand_thor /
+#       cand_liin / cand_kipa (e.g., listed for heart in cand_thor AND for
+#       kidney in cand_kipa).
+multi_organ_codes <- c("HL", "KP")
+
+multi_organ_listings <- bind_rows(
+  cand_thor %>% select(PX_ID, WL_ORG),
+  cand_liin %>% select(PX_ID, WL_ORG),
+  cand_kipa %>% select(PX_ID, WL_ORG)
+) %>%
+  filter(!is.na(WL_ORG)) %>%
+  distinct(PX_ID, WL_ORG) %>%
+  group_by(PX_ID) %>%
+  summarise(n_organ        = n_distinct(WL_ORG),
+            any_multi_code = any(WL_ORG %in% multi_organ_codes),
+            .groups        = "drop")
+
+multi_organ_ids <- multi_organ_listings %>%
+  filter(n_organ > 1 | any_multi_code) %>%
+  pull(PX_ID)
+
+cat(sprintf(paste0("Multi-organ candidates (>1 distinct WL_ORG listing ",
+                    "or WL_ORG in {%s}): %s\n"),
+            paste(multi_organ_codes, collapse = ", "),
+            comma(length(multi_organ_ids))))
+```
+
+# First-transplant lookups (per organ)
+
+```{r first_tx_all}
+# For each organ: drop multi-organ recipients (per organ-specific REC_TX_TY
+# rules), then take each candidate's first transplant date and follow-up
+# dates (TFL_DEATH_DT, TFL_LAFUDATE).
+multi_recips_hr <- tx_hr %>% filter(REC_TX_TY %in% c(2, 4))    %>% distinct(PX_ID) %>% pull(PX_ID)
+multi_recips_lu <- tx_lu %>% filter(REC_TX_TY %in% c(3, 4))    %>% distinct(PX_ID) %>% pull(PX_ID)
+multi_recips_li <- tx_li %>% filter(REC_TX_TY %in% c(2, 3, 4)) %>% distinct(PX_ID) %>% pull(PX_ID)
+multi_recips_ki <- tx_ki %>% filter(REC_TX_TY %in% c(2, 4))    %>% distinct(PX_ID) %>% pull(PX_ID)
+
+build_first_tx <- function(tx, multi_recips) {
+  tx %>%
+    filter(!PX_ID %in% multi_recips) %>%
+    arrange(PX_ID, REC_TX_DT) %>%
+    group_by(PX_ID) %>% slice(1) %>% ungroup() %>%
+    select(PX_ID, tx_date = REC_TX_DT,
+           tfl_death_dt = TFL_DEATH_DT,
+           tfl_lafudate = TFL_LAFUDATE)
+}
+first_tx_hr <- build_first_tx(tx_hr, multi_recips_hr)
+first_tx_lu <- build_first_tx(tx_lu, multi_recips_lu)
+first_tx_li <- build_first_tx(tx_li, multi_recips_li)
+first_tx_ki <- build_first_tx(tx_ki, multi_recips_ki)
+
+# Second same-organ transplant date per PERSON (PERS_ID), for the summary
+# table's "received a second transplant" category. In SRTR, PX_ID is per
+# listing; a candidate who is relisted after a failed graft gets a new PX_ID,
+# so a second same-organ transplant appears as a separate tx_<organ> row with
+# the same PERS_ID. Multi-organ recipients (REC_TX_TY rules) are excluded so
+# the second transplant is by definition another single-organ transplant.
+build_second_tx <- function(tx, multi_recips) {
+  tx %>%
+    filter(!PX_ID %in% multi_recips) %>%
+    arrange(PERS_ID, REC_TX_DT) %>%
+    group_by(PERS_ID) %>% slice(2) %>% ungroup() %>%
+    select(PERS_ID, second_tx_date = REC_TX_DT)
+}
+second_tx_hr <- build_second_tx(tx_hr, multi_recips_hr)
+second_tx_lu <- build_second_tx(tx_lu, multi_recips_lu)
+second_tx_li <- build_second_tx(tx_li, multi_recips_li)
+second_tx_ki <- build_second_tx(tx_ki, multi_recips_ki)
+```
+
+# Per-organ analytic builds
+
+Each per-organ analytic frame contains every adult candidate listed during
+either the Pre-Policy or Post-Policy window (`in_cohort_1` or `in_cohort_2`)
+who is *not* on the organ-specific multi-recipient list. The build also
+attaches the candidate's first-transplant date (if any), follow-up dates,
+exclusion flags (`is_multi_organ`, `inactive_throughout`, `data_error`),
+demographics for Table 1, and the organ-specific matching covariates.
+
+```{r build_heart, dependson=c("lookup_tables","first_tx_all","multi_organ_global","cohort_dates")}
+analytic_heart <- cand_thor %>%
+  filter(
+    WL_ORG == "HR",
+    CAN_AGE_AT_LISTING > 17,
+    !PX_ID %in% multi_recips_hr
+  ) %>%
+  left_join(region_lookup, by = c("CAN_LISTING_CTR_CD" = "CTR_CD")) %>%
+  left_join(tier_lookup,  by = c("CAN_LISTING_CTR_CD" = "CTR_CD")) %>%
+  left_join(first_tx_hr,  by = "PX_ID") %>%
+  left_join(second_tx_hr, by = "PERS_ID") %>%
+  mutate(
+    list_date       = CAN_LISTING_DT,
+    in_cohort_1     = list_date >= c1_start    & list_date <= c1_end,
+    in_cohort_2     = list_date >= c2_start    & list_date <= c2_end,
+    admin_censor = case_when(
+      in_cohort_1    ~ as.Date("2023-07-31"),
+      in_cohort_2    ~ as.Date("2025-07-31"),
+      TRUE           ~ NA_Date_
+    ),
+    days_to_admin     = as.numeric(admin_censor     - list_date),
+    transplanted      = as.integer(!is.na(tx_date) & tx_date <= admin_censor),
+
+    blood_type  = case_when(
+      CAN_ABO %in% c("A", "A1", "A2") ~ "A",
+      CAN_ABO %in% c("A1B", "A2B")    ~ "AB",
+      TRUE                             ~ CAN_ABO
+    ),
+    age         = CAN_AGE_AT_LISTING,
+    region      = as.character(REGION),
+    list_day    = as.numeric(list_date - c1_start),
+
+    female        = as.integer(CAN_GENDER == "F"),
+    bmi           = CAN_BMI,
+    race_white    = as.integer(bitwAnd(coalesce(CAN_RACE, 0L),  8L) > 0),
+    race_black    = as.integer(bitwAnd(coalesce(CAN_RACE, 0L), 16L) > 0),
+    race_asian    = as.integer(bitwAnd(coalesce(CAN_RACE, 0L), 64L) > 0),
+    race_hispanic = as.integer(!is.na(CAN_ETHNICITY_SRTR) &
+                                 CAN_ETHNICITY_SRTR == "LATINO"),
+    insurance     = case_when(
+      CAN_PRIMARY_PAY %in% c(3, 4, 13) ~ "Medicare",
+      CAN_PRIMARY_PAY == 2              ~ "Medicaid",
+      CAN_PRIMARY_PAY == 1              ~ "Private",
+      TRUE                              ~ "Other"
+    ),
+    init_status = as.character(CAN_INIT_STAT),
+    on_dialysis = as.integer(!is.na(CAN_DIAL) & CAN_DIAL %in% c(2L, 3L)),
+    simple_diag = case_when(
+      CAN_DGN >  999L & CAN_DGN < 1007L ~ "Dilated",
+      CAN_DGN %in% c(1007L, 1200L)      ~ "Ischemic",
+      CAN_DGN > 1048L & CAN_DGN < 1100L ~ "Restrictive",
+      TRUE                              ~ "Other"
+    ),
+    vad   = as.integer(!is.na(CAN_VAD_TY) & CAN_VAD_TY %in% c(2L, 3L, 5L, 6L)),
+    ecmo  = as.integer(!is.na(CAN_ECMO) & CAN_ECMO == 1L),
+    iabp  = as.integer(!is.na(CAN_IABP) & CAN_IABP == 1L),
+
+    death_date  = case_when(
+      !is.na(PERS_OPTN_DEATH_DT) ~ PERS_OPTN_DEATH_DT,
+      !is.na(PERS_SSA_DEATH_DT)  ~ PERS_SSA_DEATH_DT,
+      TRUE                       ~ NA_Date_
+    ),
+    last_fu_date = case_when(
+      !is.na(tx_date)    ~ coalesce(tfl_lafudate, tfl_death_dt),
+      !is.na(CAN_REM_DT) ~ CAN_REM_DT,
+      TRUE               ~ NA_Date_
+    ),
+    days_to_death  = as.numeric(death_date    - list_date),
+    days_to_fu     = as.numeric(last_fu_date  - list_date),
+    dead_1y        = as.integer(!is.na(days_to_death) & days_to_death <= 365 &
+                                  days_to_death <= days_to_admin),
+    follow_days_1y = case_when(
+      dead_1y == 1        ~ pmin(days_to_death, 365),
+      !is.na(days_to_fu)  ~ pmin(days_to_fu, 365, days_to_admin),
+      TRUE                ~ pmin(365, days_to_admin)
+    )
+  ) %>%
+  mutate(
+    race_other        = as.integer(race_white == 0 & race_black == 0 & race_asian == 0),
+    ethnicity         = case_when(
+      !is.na(CAN_ETHNICITY_SRTR) & CAN_ETHNICITY_SRTR == "LATINO"     ~ "Hispanic",
+      !is.na(CAN_ETHNICITY_SRTR) & CAN_ETHNICITY_SRTR == "NON-LATINO" ~ "Non-Hispanic",
+      TRUE                                                              ~ "Other"
+    ),
+    diabetes          = case_when(
+      CAN_DIAB_TY > 1 & CAN_DIAB_TY < 6 ~ "History of DM",
+      CAN_DIAB_TY == 1                  ~ "Non-diabetic",
+      TRUE                              ~ "Unknown"
+    ),
+    egfr              = 175 * (CAN_MOST_RECENT_CREAT^-1.154) * (CAN_AGE_AT_LISTING^-0.203) *
+                          if_else(!is.na(CAN_GENDER) & CAN_GENDER == "F", 0.742, 1) *
+                          if_else(race_black == 1, 1.21, 1),
+    renal_function    = case_when(
+      on_dialysis == 1 ~ "Dialysis",
+      egfr >= 60       ~ "GFR >= 60",
+      egfr >= 30       ~ "GFR 30-59",
+      egfr < 30        ~ "GFR < 30",
+      TRUE             ~ "Unknown"
+    ),
+    functional_status = case_when(
+      CAN_FUNCTN_STAT == 1 | CAN_FUNCTN_STAT > 2069              ~ "Limited Impairment, 10-30%",
+      CAN_FUNCTN_STAT > 2039 & CAN_FUNCTN_STAT < 2061            ~ "Moderate Impairment, 40-60%",
+      CAN_FUNCTN_STAT > 2000 & CAN_FUNCTN_STAT < 2031            ~ "Severe Impairment, 70-100%",
+      TRUE                                                        ~ "Unknown"
+    ),
+    pcwp_mean         = CAN_PCW_MEAN,
+    pa_mean           = CAN_PULM_ART_MEAN,
+    cardiac_index     = CAN_CARDIAC_OUTPUT /
+                          (0.007184 * (CAN_HGT_CM^0.725) * (CAN_WGT_KG^0.425)),
+    pcwp_15           = as.integer(!is.na(CAN_PCW_MEAN) & CAN_PCW_MEAN < 15),
+    severe_impairment = as.integer(functional_status == "Severe Impairment, 70-100%"),
+    diagnosis         = simple_diag,
+    dgn_code          = as.character(CAN_DGN)
+  ) %>%
+  mutate(
+    ctr_cd              = CAN_LISTING_CTR_CD,
+    init_act_dt         = CAN_INIT_ACT_STAT_DT,
+    init_inact_dt       = CAN_INIT_INACT_STAT_DT,
+    inactive_throughout = as.integer(is.na(init_act_dt) & !is.na(init_inact_dt)),
+    # Heart data error includes the legacy Status 1A/1B codes (2010, 2020),
+    # which were retired with the 2018 6-tier heart allocation policy and so
+    # are invalid in the 2019+ cohorts. BMI out of range and negative follow-up
+    # are global data errors.
+    data_error          = as.integer((!is.na(bmi) & (bmi > 100 | bmi < 10)) |
+                                       (!is.na(follow_days_1y) & follow_days_1y < 0) |
+                                       init_status %in% c("2010", "2020")),
+    is_multi_organ      = as.integer(PX_ID %in% multi_organ_ids)
+  ) %>%
+  filter(in_cohort_1 | in_cohort_2) %>%
+  select(
+    PX_ID, list_date, transplanted,
+    in_cohort_1, in_cohort_2,
+    tx_date, second_tx_date, admin_censor, death_date,
+    blood_type, age, region, list_day,
+    female, bmi, race_white, race_black, race_asian, race_other,
+    race_hispanic, ethnicity, insurance, diabetes, egfr, renal_function,
+    functional_status, init_status, on_dialysis, simple_diag, vad, ecmo, iabp,
+    pcwp_mean, pa_mean, cardiac_index, pcwp_15, severe_impairment,
+    diagnosis, dgn_code, tier19, dead_1y, follow_days_1y,
+    ctr_cd, inactive_throughout, data_error, is_multi_organ
+  )
+```
+
+```{r build_liver, dependson=c("lookup_tables","first_tx_all","multi_organ_global","cohort_dates")}
+analytic_liver <- cand_liin %>%
+  filter(
+    WL_ORG == "LI",
+    CAN_AGE_AT_LISTING > 17,
+    !PX_ID %in% multi_recips_li
+  ) %>%
+  left_join(region_lookup, by = c("CAN_LISTING_CTR_CD" = "CTR_CD")) %>%
+  left_join(tier_lookup,  by = c("CAN_LISTING_CTR_CD" = "CTR_CD")) %>%
+  left_join(first_tx_li,  by = "PX_ID") %>%
+  left_join(second_tx_li, by = "PERS_ID") %>%
+  mutate(
+    list_date       = CAN_LISTING_DT,
+    in_cohort_1     = list_date >= c1_start    & list_date <= c1_end,
+    in_cohort_2     = list_date >= c2_start    & list_date <= c2_end,
+    admin_censor = case_when(
+      in_cohort_1    ~ as.Date("2023-07-31"),
+      in_cohort_2    ~ as.Date("2025-07-31"),
+      TRUE           ~ NA_Date_
+    ),
+    days_to_admin     = as.numeric(admin_censor     - list_date),
+    transplanted      = as.integer(!is.na(tx_date) & tx_date <= admin_censor),
+
+    blood_type  = case_when(
+      CAN_ABO %in% c("A", "A1", "A2") ~ "A",
+      CAN_ABO %in% c("A1B", "A2B")    ~ "AB",
+      TRUE                             ~ CAN_ABO
+    ),
+    age         = CAN_AGE_AT_LISTING,
+    region      = as.character(REGION),
+    list_day    = as.numeric(list_date - c1_start),
+
+    female        = as.integer(CAN_GENDER == "F"),
+    bmi           = CAN_BMI,
+    race_white    = as.integer(bitwAnd(coalesce(CAN_RACE, 0L),  8L) > 0),
+    race_black    = as.integer(bitwAnd(coalesce(CAN_RACE, 0L), 16L) > 0),
+    race_asian    = as.integer(bitwAnd(coalesce(CAN_RACE, 0L), 64L) > 0),
+    race_hispanic = as.integer(!is.na(CAN_ETHNICITY_SRTR) &
+                                 CAN_ETHNICITY_SRTR == "LATINO"),
+    insurance     = case_when(
+      CAN_PRIMARY_PAY %in% c(3, 4, 13) ~ "Medicare",
+      CAN_PRIMARY_PAY == 2              ~ "Medicaid",
+      CAN_PRIMARY_PAY == 1              ~ "Private",
+      TRUE                              ~ "Other"
+    ),
+    init_status = as.character(CAN_INIT_STAT),
+    meld_init   = ifelse(CAN_INIT_SRTR_LAB_MELD >= 6200 & CAN_INIT_SRTR_LAB_MELD <= 6240,
+                         CAN_INIT_SRTR_LAB_MELD - 6200, NA_real_),
+    on_dialysis = as.integer(!is.na(CAN_LAST_DIAL_PRIOR_WEEK) &
+                               CAN_LAST_DIAL_PRIOR_WEEK == "Y"),
+    diag        = ifelse(is.na(CAN_DGN), "Unknown", as.character(CAN_DGN)),
+
+    death_date  = case_when(
+      !is.na(PERS_OPTN_DEATH_DT) ~ PERS_OPTN_DEATH_DT,
+      !is.na(PERS_SSA_DEATH_DT)  ~ PERS_SSA_DEATH_DT,
+      TRUE                       ~ NA_Date_
+    ),
+    last_fu_date = case_when(
+      !is.na(tx_date)     ~ coalesce(tfl_lafudate, tfl_death_dt),
+      !is.na(CAN_REM_DT)  ~ CAN_REM_DT,
+      TRUE                ~ NA_Date_
+    ),
+    days_to_death  = as.numeric(death_date   - list_date),
+    days_to_fu     = as.numeric(last_fu_date - list_date),
+    dead_1y        = as.integer(!is.na(days_to_death) & days_to_death <= 365 &
+                                  days_to_death <= days_to_admin),
+    follow_days_1y = case_when(
+      dead_1y == 1       ~ pmin(days_to_death, 365),
+      !is.na(days_to_fu) ~ pmin(days_to_fu, 365, days_to_admin),
+      TRUE               ~ pmin(365, days_to_admin)
+    )
+  ) %>%
+  mutate(
+    race_other        = as.integer(race_white == 0 & race_black == 0 & race_asian == 0),
+    ethnicity         = case_when(
+      !is.na(CAN_ETHNICITY_SRTR) & CAN_ETHNICITY_SRTR == "LATINO"     ~ "Hispanic",
+      !is.na(CAN_ETHNICITY_SRTR) & CAN_ETHNICITY_SRTR == "NON-LATINO" ~ "Non-Hispanic",
+      TRUE                                                              ~ "Other"
+    ),
+    diabetes          = case_when(
+      CAN_DIAB_TY > 1 & CAN_DIAB_TY < 6 ~ "History of DM",
+      CAN_DIAB_TY == 1                  ~ "Non-diabetic",
+      TRUE                              ~ "Unknown"
+    ),
+    egfr              = 175 * (CAN_LAST_SERUM_CREAT^-1.154) * (CAN_AGE_AT_LISTING^-0.203) *
+                          if_else(!is.na(CAN_GENDER) & CAN_GENDER == "F", 0.742, 1) *
+                          if_else(race_black == 1, 1.21, 1),
+    renal_function    = case_when(
+      on_dialysis == 1 ~ "Dialysis",
+      egfr >= 60       ~ "GFR >= 60",
+      egfr >= 30       ~ "GFR 30-59",
+      egfr < 30        ~ "GFR < 30",
+      TRUE             ~ "Unknown"
+    ),
+    functional_status = case_when(
+      CAN_FUNCTN_STAT == 1 | CAN_FUNCTN_STAT > 2069              ~ "Limited Impairment, 10-30%",
+      CAN_FUNCTN_STAT > 2039 & CAN_FUNCTN_STAT < 2061            ~ "Moderate Impairment, 40-60%",
+      CAN_FUNCTN_STAT > 2000 & CAN_FUNCTN_STAT < 2031            ~ "Severe Impairment, 70-100%",
+      TRUE                                                        ~ "Unknown"
+    )
+  ) %>%
+  mutate(
+    ctr_cd              = CAN_LISTING_CTR_CD,
+    init_act_dt         = CAN_INIT_ACT_STAT_DT,
+    init_inact_dt       = CAN_INIT_INACT_STAT_DT,
+    inactive_throughout = as.integer(is.na(init_act_dt) & !is.na(init_inact_dt)),
+    data_error          = as.integer((!is.na(bmi) & (bmi > 100 | bmi < 10)) |
+                                       (!is.na(follow_days_1y) & follow_days_1y < 0)),
+    is_multi_organ      = as.integer(PX_ID %in% multi_organ_ids)
+  ) %>%
+  filter(in_cohort_1 | in_cohort_2) %>%
+  select(
+    PX_ID, list_date, transplanted,
+    in_cohort_1, in_cohort_2,
+    tx_date, second_tx_date, admin_censor, death_date,
+    blood_type, age, region, list_day,
+    female, bmi, race_white, race_black, race_asian, race_other,
+    race_hispanic, ethnicity, insurance, diabetes, egfr, renal_function,
+    functional_status, init_status, meld_init, on_dialysis, diag,
+    tier19, dead_1y, follow_days_1y,
+    ctr_cd, inactive_throughout, data_error, is_multi_organ
+  )
+```
+
+```{r build_lung, dependson=c("lookup_tables","first_tx_all","multi_organ_global","cohort_dates")}
+analytic_lung <- cand_thor %>%
+  filter(
+    WL_ORG == "LU",
+    CAN_AGE_AT_LISTING > 17,
+    !PX_ID %in% multi_recips_lu
+  ) %>%
+  left_join(region_lookup, by = c("CAN_LISTING_CTR_CD" = "CTR_CD")) %>%
+  left_join(tier_lookup,  by = c("CAN_LISTING_CTR_CD" = "CTR_CD")) %>%
+  left_join(first_tx_lu,  by = "PX_ID") %>%
+  left_join(second_tx_lu, by = "PERS_ID") %>%
+  mutate(
+    list_date       = CAN_LISTING_DT,
+    in_cohort_1     = list_date >= c1_start    & list_date <= c1_end,
+    in_cohort_2     = list_date >= c2_start    & list_date <= c2_end,
+    admin_censor = case_when(
+      in_cohort_1    ~ as.Date("2023-07-31"),
+      in_cohort_2    ~ as.Date("2025-07-31"),
+      TRUE           ~ NA_Date_
+    ),
+    days_to_admin     = as.numeric(admin_censor     - list_date),
+    transplanted      = as.integer(!is.na(tx_date) & tx_date <= admin_censor),
+
+    blood_type  = case_when(
+      CAN_ABO %in% c("A", "A1", "A2") ~ "A",
+      CAN_ABO %in% c("A1B", "A2B")    ~ "AB",
+      TRUE                             ~ CAN_ABO
+    ),
+    age         = CAN_AGE_AT_LISTING,
+    region      = as.character(REGION),
+    list_day    = as.numeric(list_date - c1_start),
+
+    female        = as.integer(CAN_GENDER == "F"),
+    bmi           = CAN_BMI,
+    race_white    = as.integer(bitwAnd(coalesce(CAN_RACE, 0L),  8L) > 0),
+    race_black    = as.integer(bitwAnd(coalesce(CAN_RACE, 0L), 16L) > 0),
+    race_asian    = as.integer(bitwAnd(coalesce(CAN_RACE, 0L), 64L) > 0),
+    race_hispanic = as.integer(!is.na(CAN_ETHNICITY_SRTR) &
+                                 CAN_ETHNICITY_SRTR == "LATINO"),
+    insurance     = case_when(
+      CAN_PRIMARY_PAY %in% c(3, 4, 13) ~ "Medicare",
+      CAN_PRIMARY_PAY == 2              ~ "Medicaid",
+      CAN_PRIMARY_PAY == 1              ~ "Private",
+      TRUE                              ~ "Other"
+    ),
+    init_status = as.character(CAN_INIT_STAT),
+    on_dialysis = as.integer(!is.na(CAN_DIAL) & CAN_DIAL %in% c(2L, 3L)),
+    diag_group  = case_when(
+      CAN_DGN %in% c(1600L, 1605L, 1606L, 1607L) ~ "A",
+      CAN_DGN %in% c(1500L, 1508L, 1510L)        ~ "B",
+      CAN_DGN %in% c(1501L, 1502L)               ~ "C",
+      TRUE                                        ~ "D"
+    ),
+
+    death_date  = case_when(
+      !is.na(PERS_OPTN_DEATH_DT) ~ PERS_OPTN_DEATH_DT,
+      !is.na(PERS_SSA_DEATH_DT)  ~ PERS_SSA_DEATH_DT,
+      TRUE                       ~ NA_Date_
+    ),
+    last_fu_date = case_when(
+      !is.na(tx_date)     ~ coalesce(tfl_lafudate, tfl_death_dt),
+      !is.na(CAN_REM_DT)  ~ CAN_REM_DT,
+      TRUE                ~ NA_Date_
+    ),
+    days_to_death  = as.numeric(death_date    - list_date),
+    days_to_fu     = as.numeric(last_fu_date  - list_date),
+    dead_1y        = as.integer(!is.na(days_to_death) & days_to_death <= 365 &
+                                  days_to_death <= days_to_admin),
+    follow_days_1y = case_when(
+      dead_1y == 1        ~ pmin(days_to_death, 365),
+      !is.na(days_to_fu)  ~ pmin(days_to_fu, 365, days_to_admin),
+      TRUE                ~ pmin(365, days_to_admin)
+    )
+  ) %>%
+  mutate(
+    race_other        = as.integer(race_white == 0 & race_black == 0 & race_asian == 0),
+    ethnicity         = case_when(
+      !is.na(CAN_ETHNICITY_SRTR) & CAN_ETHNICITY_SRTR == "LATINO"     ~ "Hispanic",
+      !is.na(CAN_ETHNICITY_SRTR) & CAN_ETHNICITY_SRTR == "NON-LATINO" ~ "Non-Hispanic",
+      TRUE                                                              ~ "Other"
+    ),
+    diabetes          = case_when(
+      CAN_DIAB_TY > 1 & CAN_DIAB_TY < 6 ~ "History of DM",
+      CAN_DIAB_TY == 1                  ~ "Non-diabetic",
+      TRUE                              ~ "Unknown"
+    ),
+    egfr              = 175 * (CAN_MOST_RECENT_CREAT^-1.154) * (CAN_AGE_AT_LISTING^-0.203) *
+                          if_else(!is.na(CAN_GENDER) & CAN_GENDER == "F", 0.742, 1) *
+                          if_else(race_black == 1, 1.21, 1),
+    renal_function    = case_when(
+      on_dialysis == 1 ~ "Dialysis",
+      egfr >= 60       ~ "GFR >= 60",
+      egfr >= 30       ~ "GFR 30-59",
+      egfr < 30        ~ "GFR < 30",
+      TRUE             ~ "Unknown"
+    ),
+    functional_status = case_when(
+      CAN_FUNCTN_STAT == 1 | CAN_FUNCTN_STAT > 2069              ~ "Limited Impairment, 10-30%",
+      CAN_FUNCTN_STAT > 2039 & CAN_FUNCTN_STAT < 2061            ~ "Moderate Impairment, 40-60%",
+      CAN_FUNCTN_STAT > 2000 & CAN_FUNCTN_STAT < 2031            ~ "Severe Impairment, 70-100%",
+      TRUE                                                        ~ "Unknown"
+    ),
+    dgn_code          = as.character(CAN_DGN)
+  ) %>%
+  mutate(
+    ctr_cd              = CAN_LISTING_CTR_CD,
+    init_act_dt         = CAN_INIT_ACT_STAT_DT,
+    init_inact_dt       = CAN_INIT_INACT_STAT_DT,
+    inactive_throughout = as.integer(is.na(init_act_dt) & !is.na(init_inact_dt)),
+    data_error          = as.integer((!is.na(bmi) & (bmi > 100 | bmi < 10)) |
+                                       (!is.na(follow_days_1y) & follow_days_1y < 0)),
+    is_multi_organ      = as.integer(PX_ID %in% multi_organ_ids)
+  ) %>%
+  filter(in_cohort_1 | in_cohort_2) %>%
+  select(
+    PX_ID, list_date, transplanted,
+    in_cohort_1, in_cohort_2,
+    tx_date, second_tx_date, admin_censor, death_date,
+    blood_type, age, region, list_day,
+    female, bmi, race_white, race_black, race_asian, race_other,
+    race_hispanic, ethnicity, insurance, diabetes, egfr, renal_function,
+    functional_status, init_status, on_dialysis, diag_group, dgn_code, tier19,
+    dead_1y, follow_days_1y,
+    ctr_cd, inactive_throughout, data_error, is_multi_organ
+  )
+```
+
+```{r build_kidney, dependson=c("lookup_tables","first_tx_all","multi_organ_global","cohort_dates")}
+# Prior-solid-transplant flag for EPTS (used by downstream kidney chunks).
+prev_tx_lookup <- cand_kipa %>%
+  transmute(PX_ID,
+            prev_solid_tx = as.integer(!is.na(CAN_PREV_TX) & CAN_PREV_TX > 0))
+
+analytic_kidney <- cand_kipa %>%
+  filter(
+    WL_ORG == "KI",
+    CAN_AGE_AT_LISTING > 17,
+    !PX_ID %in% multi_recips_ki
+  ) %>%
+  left_join(prev_tx_lookup, by = "PX_ID") %>%
+  left_join(region_lookup, by = c("CAN_LISTING_CTR_CD" = "CTR_CD")) %>%
+  left_join(tier_lookup,  by = c("CAN_LISTING_CTR_CD" = "CTR_CD")) %>%
+  left_join(first_tx_ki,  by = "PX_ID") %>%
+  left_join(second_tx_ki, by = "PERS_ID") %>%
+  mutate(
+    list_date       = CAN_LISTING_DT,
+    in_cohort_1     = list_date >= c1_start    & list_date <= c1_end,
+    in_cohort_2     = list_date >= c2_start    & list_date <= c2_end,
+    admin_censor = case_when(
+      in_cohort_1    ~ as.Date("2023-07-31"),
+      in_cohort_2    ~ as.Date("2025-07-31"),
+      TRUE           ~ NA_Date_
+    ),
+    days_to_admin     = as.numeric(admin_censor     - list_date),
+    transplanted      = as.integer(!is.na(tx_date) & tx_date <= admin_censor),
+
+    blood_type = case_when(
+      CAN_ABO %in% c("A", "A1", "A2") ~ "A",
+      CAN_ABO %in% c("A1B", "A2B")    ~ "AB",
+      TRUE                             ~ CAN_ABO
+    ),
+    age         = CAN_AGE_AT_LISTING,
+    region      = as.character(REGION),
+    list_day    = as.numeric(list_date - c1_start),
+
+    female        = as.integer(CAN_GENDER == "F"),
+    bmi           = CAN_BMI,
+    race_white    = coalesce(as.integer(CAN_RACE_WHITE), 0L),
+    race_black    = coalesce(as.integer(CAN_RACE_BLACK_AFRICAN_AMERICAN), 0L),
+    race_asian    = coalesce(as.integer(CAN_RACE_ASIAN), 0L),
+    race_hispanic = as.integer(!is.na(CAN_ETHNICITY_SRTR) &
+                                 CAN_ETHNICITY_SRTR == "LATINO"),
+    insurance     = case_when(
+      CAN_PRIMARY_PAY %in% c(3, 4, 13) ~ "Medicare",
+      CAN_PRIMARY_PAY == 2              ~ "Medicaid",
+      CAN_PRIMARY_PAY == 1              ~ "Private",
+      TRUE                              ~ "Other"
+    ),
+    on_dialysis   = as.integer(CAN_ON_DIAL == "Y"),
+    dialysis_days = case_when(
+      CAN_ON_DIAL == "Y" & !is.na(CAN_DIAL_DT) ~
+        as.numeric(list_date - CAN_DIAL_DT),
+      TRUE ~ 0
+    ),
+    diag = ifelse(is.na(CAN_DGN), "Unknown", as.character(CAN_DGN)),
+
+    death_date = case_when(
+      !is.na(PERS_OPTN_DEATH_DT) ~ PERS_OPTN_DEATH_DT,
+      !is.na(PERS_SSA_DEATH_DT)  ~ PERS_SSA_DEATH_DT,
+      TRUE                       ~ NA_Date_
+    ),
+    last_fu_date = case_when(
+      !is.na(tx_date)     ~ coalesce(tfl_lafudate, tfl_death_dt),
+      !is.na(CAN_REM_DT)  ~ CAN_REM_DT,
+      TRUE                ~ NA_Date_
+    ),
+    days_to_death  = as.numeric(death_date   - list_date),
+    days_to_fu     = as.numeric(last_fu_date - list_date),
+    dead_1y        = as.integer(!is.na(days_to_death) & days_to_death <= 365 &
+                                  days_to_death <= days_to_admin),
+    follow_days_1y = case_when(
+      dead_1y == 1       ~ pmin(days_to_death, 365),
+      !is.na(days_to_fu) ~ pmin(days_to_fu, 365, days_to_admin),
+      TRUE               ~ pmin(365, days_to_admin)
+    )
+  ) %>%
+  mutate(
+    race_other        = as.integer(race_white == 0 & race_black == 0 & race_asian == 0),
+    ethnicity         = case_when(
+      !is.na(CAN_ETHNICITY_SRTR) & CAN_ETHNICITY_SRTR == "LATINO"     ~ "Hispanic",
+      !is.na(CAN_ETHNICITY_SRTR) & CAN_ETHNICITY_SRTR == "NON-LATINO" ~ "Non-Hispanic",
+      TRUE                                                              ~ "Other"
+    ),
+    diabetes          = case_when(
+      CAN_DIAB_TY > 1 & CAN_DIAB_TY < 6 ~ "History of DM",
+      CAN_DIAB_TY == 1                  ~ "Non-diabetic",
+      TRUE                              ~ "Unknown"
+    ),
+    egfr              = if_else(!is.na(CAN_GFR), CAN_GFR,
+                          175 * (CAN_MIN_FINAL_CREAT^-1.154) *
+                            (CAN_AGE_AT_LISTING^-0.203) *
+                            if_else(!is.na(CAN_GENDER) & CAN_GENDER == "F", 0.742, 1) *
+                            if_else(race_black == 1, 1.21, 1)),
+    renal_function    = case_when(
+      on_dialysis == 1 ~ "Dialysis",
+      egfr >= 60       ~ "GFR >= 60",
+      egfr >= 30       ~ "GFR 30-59",
+      egfr < 30        ~ "GFR < 30",
+      TRUE             ~ "Unknown"
+    ),
+    functional_status = case_when(
+      CAN_FUNCTN_STAT == 1 | CAN_FUNCTN_STAT > 2069              ~ "Limited Impairment, 10-30%",
+      CAN_FUNCTN_STAT > 2039 & CAN_FUNCTN_STAT < 2061            ~ "Moderate Impairment, 40-60%",
+      CAN_FUNCTN_STAT > 2000 & CAN_FUNCTN_STAT < 2031            ~ "Severe Impairment, 70-100%",
+      TRUE                                                        ~ "Unknown"
+    )
+  ) %>%
+  mutate(
+    ctr_cd              = CAN_LISTING_CTR_CD,
+    init_act_dt         = CAN_INIT_ACT_STAT_DT,
+    init_inact_dt       = CAN_INIT_INACT_STAT_DT,
+    inactive_throughout = as.integer(is.na(init_act_dt) & !is.na(init_inact_dt)),
+    data_error          = as.integer((!is.na(bmi) & (bmi > 100 | bmi < 10)) |
+                                       (!is.na(follow_days_1y) & follow_days_1y < 0)),
+    is_multi_organ      = as.integer(PX_ID %in% multi_organ_ids)
+  ) %>%
+  filter(in_cohort_1 | in_cohort_2) %>%
+  select(
+    PX_ID, list_date, transplanted,
+    in_cohort_1, in_cohort_2,
+    tx_date, second_tx_date, admin_censor, death_date,
+    blood_type, age, region, list_day,
+    female, bmi, race_white, race_black, race_asian, race_other,
+    race_hispanic, ethnicity, insurance, diabetes, egfr, renal_function,
+    functional_status, on_dialysis, dialysis_days, diag,
+    tier19, dead_1y, follow_days_1y, prev_solid_tx,
+    ctr_cd, inactive_throughout, data_error, is_multi_organ
+  )
+```
+
+```{r free_sas_data, cache=FALSE}
+remove(region_lookup, tier_lookup, multi_organ_listings,
+       first_tx_hr, first_tx_lu, first_tx_li, first_tx_ki)
+```
+
+# Global exclusions
+
+```{r global_exclusions, dependson=c("build_heart","build_liver","build_lung","build_kidney"), cache=FALSE}
+analytic_list <- list(Heart  = analytic_heart,
+                      Liver  = analytic_liver,
+                      Lung   = analytic_lung,
+                      Kidney = analytic_kidney)
+
+apply_global <- function(d) {
+  step0 <- d
+  step1 <- step0 %>% filter(is_multi_organ      == 0)
+  step2 <- step1 %>% filter(inactive_throughout == 0)
+  step3 <- step2 %>% filter(data_error          == 0)
+  list(
+    step0 = step0, step1 = step1, step2 = step2, step3 = step3,
+    n_listed = nrow(step0),
+    n_multi  = nrow(step0) - nrow(step1),
+    n_inact  = nrow(step1) - nrow(step2),
+    n_derr   = nrow(step2) - nrow(step3),
+    n_after  = nrow(step3)
+  )
+}
+global_results <- lapply(analytic_list, apply_global)
+
+cat("Global exclusions (applied to each organ's analytic frame):\n\n")
+totals <- c(listed = 0, multi = 0, inact = 0, derr = 0, after = 0)
+for (org in names(global_results)) {
+  g <- global_results[[org]]
+  cat(sprintf("  %s\n", org))
+  cat(sprintf("    Listed in Pre or Post window:              %s\n", comma(g$n_listed)))
+  cat(sprintf("      - Multi-organ candidate/recipient:       -%s\n", comma(g$n_multi)))
+  cat(sprintf("      - Inactive at listing & never active:    -%s\n", comma(g$n_inact)))
+  cat(sprintf("      - Data entry errors:                     -%s\n", comma(g$n_derr)))
+  cat(sprintf("    After global exclusions:                   %s\n\n", comma(g$n_after)))
+  totals["listed"] <- totals["listed"] + g$n_listed
+  totals["multi"]  <- totals["multi"]  + g$n_multi
+  totals["inact"]  <- totals["inact"]  + g$n_inact
+  totals["derr"]   <- totals["derr"]   + g$n_derr
+  totals["after"]  <- totals["after"]  + g$n_after
+}
+cat(sprintf("  TOTAL across organs\n"))
+cat(sprintf("    Listed in Pre or Post window:              %s\n", comma(totals["listed"])))
+cat(sprintf("      - Multi-organ candidate/recipient:       -%s\n", comma(totals["multi"])))
+cat(sprintf("      - Inactive at listing & never active:    -%s\n", comma(totals["inact"])))
+cat(sprintf("      - Data entry errors:                     -%s\n", comma(totals["derr"])))
+cat(sprintf("    After global exclusions:                   %s\n", comma(totals["after"])))
+
+post_global <- lapply(global_results, `[[`, "step3")
+```
+
+# Per-organ exclusions, matching, and per-period outputs
+
+```{r per_organ_match, dependson="global_exclusions", cache=FALSE}
+# Per-organ matching covariate sets and matchit specifications.
+match_spec <- list(
+  Heart = list(
+    covars   = "blood_type + age + region + list_day + init_status + on_dialysis + simple_diag + vad + ecmo + iabp",
+    mahvars  = ~ age + list_day + on_dialysis + vad + ecmo + iabp,
+    required = c("blood_type", "age", "region", "init_status", "simple_diag")
+  ),
+  Liver = list(
+    covars   = "blood_type + age + region + list_day + init_status + meld_init + on_dialysis + diag",
+    mahvars  = ~ age + list_day + meld_init + on_dialysis,
+    required = c("blood_type", "age", "region", "init_status", "meld_init")
+  ),
+  Lung = list(
+    covars   = "blood_type + age + region + list_day + init_status + on_dialysis + diag_group",
+    mahvars  = ~ age + list_day + on_dialysis,
+    required = c("blood_type", "age", "region", "init_status")
+  ),
+  Kidney = list(
+    covars   = "blood_type + age + region + list_day + on_dialysis + dialysis_days + diag",
+    mahvars  = ~ age + list_day + on_dialysis + dialysis_days,
+    required = c("blood_type", "age", "region")
+  )
+)
+
+# Per-organ tx tables (for low-volume-center thresholds)
+tx_by_organ <- list(Heart = tx_hr, Liver = tx_li, Lung = tx_lu, Kidney = tx_ki)
+
+# Per-organ window-length cohort starts/ends (identical across organs)
+window_years_1 <- as.numeric(c1_end - c1_start) / 365.25
+window_years_2 <- as.numeric(c2_end - c2_start) / 365.25
+
+low_vol_centers <- function(tx, start, end, window_years) {
+  tx %>%
+    filter(!is.na(REC_TX_DT), REC_TX_DT >= start, REC_TX_DT <= end,
+           !is.na(REC_TX_PROCEDURE_TY)) %>%
+    count(REC_CTR_CD, name = "n_tx") %>%
+    mutate(n_tx_per_year = n_tx / window_years) %>%
+    filter(n_tx_per_year <= 2) %>% pull(REC_CTR_CD)
+}
+
+seed_for <- function(organ, period) {
+  off <- match(organ,  c("Heart", "Liver", "Lung", "Kidney")) * 100L +
+         match(period, c("Pre",   "Post"))
+  bitwXor(20210930L, off)
+}
+
+# Storage for cohorts, matched data, and per-(organ, period) counts
+cohort_out  <- list()
+matched_out <- list()
+exc_low     <- list()
+exc_miss    <- list()
+n_unmatched <- list()
+
+for (organ in names(post_global)) {
+  spec    <- match_spec[[organ]]
+  tx_o    <- tx_by_organ[[organ]]
+  post_g  <- post_global[[organ]]
+
+  lvc1 <- low_vol_centers(tx_o, c1_start, c1_end, window_years_1)
+  lvc2 <- low_vol_centers(tx_o, c2_start, c2_end, window_years_2)
+
+  for (period in c("Pre", "Post")) {
+    if (period == "Pre") {
+      pre_low <- post_g %>% filter(in_cohort_1)
+      lvc <- lvc1
+    } else {
+      pre_low <- post_g %>% filter(in_cohort_2)
+      lvc <- lvc2
+    }
+    after_low <- pre_low %>% filter(!ctr_cd %in% lvc)
+    n_lv <- nrow(pre_low) - nrow(after_low)
+
+    after_cov <- after_low %>% filter(follow_days_1y > 0)
+    for (col in spec$required) {
+      after_cov <- after_cov %>% filter(!is.na(.data[[col]]))
+    }
+    n_miss <- nrow(after_low) - nrow(after_cov)
+
+    cohort_df <- after_cov %>%
+      mutate(cohort = paste0(period, "-Policy"))
+    cohort_out[[paste(organ, period, sep = "_")]] <- cohort_df
+
+    set.seed(seed_for(organ, period))
+    fit <- matchit(
+      as.formula(paste("transplanted ~", spec$covars)),
+      data     = cohort_df,
+      method   = "nearest",
+      distance = "glm",
+      link     = "probit",
+      mahvars  = spec$mahvars,
+      ratio    = 1,
+      replace  = FALSE
+    )
+    md <- match.data(fit)
+    matched_out[[paste(organ, period, sep = "_")]] <- md
+
+    # Unmatched = total candidates not in matched pairs (both arms).
+    n_unmatched_cell <- nrow(cohort_df) - nrow(md)
+
+    exc_low[[paste(organ, period, sep = "_")]]  <- n_lv
+    exc_miss[[paste(organ, period, sep = "_")]] <- n_miss
+    n_unmatched[[paste(organ, period, sep = "_")]] <- n_unmatched_cell
+  }
+}
+
+total_low  <- sum(unlist(exc_low))
+total_miss <- sum(unlist(exc_miss))
+total_derr <- sum(sapply(global_results, `[[`, "n_derr"))
+total_data_or_miss <- total_derr + total_miss
+
+cat("\nPer-organ exclusions (totals across all organs and periods):\n")
+cat(sprintf("  - Low-volume center (<= 2 tx/yr):                       -%s\n",
+            comma(total_low)))
+cat(sprintf("  - Data entry errors or missing matching covariates:     -%s\n",
+            comma(total_data_or_miss)))
+
+cat("\nUnmatched candidates (waitlisted + transplanted, by period):\n")
+for (period in c("Pre", "Post")) {
+  by_period <- sum(unlist(n_unmatched[grepl(paste0("_", period, "$"), names(n_unmatched))]))
+  cat(sprintf("  %s-Policy total: %s unmatched candidates\n",
+              period, comma(by_period)))
+}
+cat("\nUnmatched candidates (waitlisted + transplanted, by organ x period):\n")
+for (organ in names(post_global)) {
+  for (period in c("Pre", "Post")) {
+    key <- paste(organ, period, sep = "_")
+    cat(sprintf("  %-7s %-4s : %s\n", organ, period, comma(n_unmatched[[key]])))
+  }
+}
+```
+
+# Summary table
+
+```{r summary_table, dependson="per_organ_match", cache=FALSE}
+# Counts each candidate at most once and walks them through the exclusion
+# cascade in user-specified order: (1) Multi-organ candidate, (2) Low-volume
+# transplant center, (3) Never activated on waiting list, (4) Data entry
+# error or missing matching covariates. Final breakdown reports per-period
+# eligible / unmatched / matched counts and a partition of each matched
+# cohort by transplant status, second-transplant receipt, and survival
+# through admin_censor.
+
+# Starting frame: every adult listing in cand_thor / cand_liin / cand_kipa
+# whose WL_ORG is one of the four study organs or one of the multi-organ
+# codes present in the Pre/Post windows (HL, KP). Pancreas-alone (PA) and
+# intestine-alone (IN) candidates are NOT counted in the starting N.
+study_wl_orgs <- c("HR", "LU", "LI", "KI", multi_organ_codes)
+
+in_window <- function(d) {
+  d %>%
+    filter(WL_ORG %in% study_wl_orgs,
+           CAN_AGE_AT_LISTING > 17,
+           (CAN_LISTING_DT >= c1_start & CAN_LISTING_DT <= c1_end) |
+           (CAN_LISTING_DT >= c2_start & CAN_LISTING_DT <= c2_end)) %>%
+    select(PX_ID)
+}
+starting_pxids <- bind_rows(
+  in_window(cand_thor),
+  in_window(cand_liin),
+  in_window(cand_kipa)
+) %>% distinct(PX_ID) %>% pull(PX_ID)
+n_start <- length(starting_pxids)
+
+# Build the combined frame of "passed multi-organ filter" candidates. This is
+# the union of the four per-organ analytic frames, after dropping
+# (i) cross-table multi-listed candidates via is_multi_organ == 0, and
+# (ii) restricting to the main Pre/Post windows. The per-organ builds already
+# dropped HL/KP candidates (WL_ORG filter) and multi-organ-transplant recipients
+# (REC_TX_TY 2/3/4 via !PX_ID %in% multi_recips_<organ>).
+combined_analytic <- bind_rows(
+  analytic_heart  %>% mutate(study_organ = "Heart"),
+  analytic_liver  %>% mutate(study_organ = "Liver"),
+  analytic_lung   %>% mutate(study_organ = "Lung"),
+  analytic_kidney %>% mutate(study_organ = "Kidney")
+) %>%
+  filter(is_multi_organ == 0,
+         (in_cohort_1 | in_cohort_2))
+
+# Step 1: Multi-organ exclusion total = starting N - candidates remaining
+# after the multi-organ filter. This captures all three sub-categories:
+# (a) multi-organ WL_ORG (HL, KP), (b) cross-table multi-listed candidates,
+# and (c) multi-organ transplant recipients (REC_TX_TY 2/3/4).
+n_excl_multi_total <- n_start - nrow(combined_analytic)
+
+# Per-(organ, period) low-volume center lookup. A given candidate's organ-period
+# determines whether their listing center is low-volume.
+lvc_keys <- list()
+for (org in c("Heart", "Liver", "Lung", "Kidney")) {
+  tx_o <- tx_by_organ[[org]]
+  lvc_keys[[paste(org, "Pre")]]  <- low_vol_centers(tx_o, c1_start, c1_end, window_years_1)
+  lvc_keys[[paste(org, "Post")]] <- low_vol_centers(tx_o, c2_start, c2_end, window_years_2)
+}
+lvc_df <- do.call(rbind, lapply(names(lvc_keys), function(k) {
+  parts <- strsplit(k, " ")[[1]]
+  data.frame(study_organ = parts[1], period_str = parts[2],
+             ctr_cd      = lvc_keys[[k]],
+             is_low_vol  = TRUE,
+             stringsAsFactors = FALSE)
+}))
+
+combined_classified <- combined_analytic %>%
+  mutate(period_str = if_else(in_cohort_1, "Pre", "Post")) %>%
+  left_join(lvc_df, by = c("study_organ", "period_str", "ctr_cd")) %>%
+  mutate(is_low_vol = !is.na(is_low_vol))
+
+# Per-organ required-covariates check: a candidate's missing_req flag is TRUE
+# if any of their organ's required matching covariates is NA.
+combined_classified$missing_req <- FALSE
+for (org in c("Heart", "Liver", "Lung", "Kidney")) {
+  required <- match_spec[[org]]$required
+  if (length(required) == 0) next
+  idx <- combined_classified$study_organ == org
+  miss <- rep(FALSE, sum(idx))
+  for (col in required) {
+    miss <- miss | is.na(combined_classified[[col]][idx])
+  }
+  combined_classified$missing_req[idx] <- miss
+}
+combined_classified <- combined_classified %>%
+  mutate(data_err_or_missing = (data_error == 1 | follow_days_1y <= 0 | missing_req))
+
+step_low    <- combined_classified %>% filter(!is_low_vol)
+n_excl_low  <- nrow(combined_classified) - nrow(step_low)
+
+step_inact  <- step_low %>% filter(inactive_throughout == 0)
+n_excl_inact <- nrow(step_low) - nrow(step_inact)
+
+step_eligible <- step_inact %>% filter(!data_err_or_missing)
+n_excl_data   <- nrow(step_inact) - nrow(step_eligible)
+
+n_eligible <- nrow(step_eligible)
+
+# Sanity check: n_eligible should match sum of cohort_out sizes.
+n_eligible_via_cohort_out <- sum(sapply(cohort_out, nrow))
+stopifnot(n_eligible == n_eligible_via_cohort_out)
+
+# Pre / Post breakdown
+sum_cohort  <- function(period) sum(sapply(
+  cohort_out[grepl(paste0("_", period, "$"), names(cohort_out))], nrow))
+sum_matched <- function(period) sum(sapply(
+  matched_out[grepl(paste0("_", period, "$"), names(matched_out))], nrow))
+
+n_eligible_pre   <- sum_cohort("Pre")
+n_eligible_post  <- sum_cohort("Post")
+n_matched_pre    <- sum_matched("Pre")
+n_matched_post   <- sum_matched("Post")
+n_unmatched_pre  <- n_eligible_pre  - n_matched_pre
+n_unmatched_post <- n_eligible_post - n_matched_post
+
+# Matched-cohort N's by status at admin_censor. Categories partition each
+# matched cohort:
+#   received transplant = alive_recipients + died_post_tx + got_second_tx
+#   waitlisted          = died_pre_tx     + alive_waitlisted
+classify_matched <- function(period) {
+  md <- bind_rows(matched_out[grepl(paste0("_", period, "$"), names(matched_out))])
+  md <- md %>%
+    mutate(
+      died_by_admin    = !is.na(death_date) & death_date <= admin_censor,
+      got_second_tx    = transplanted == 1 &
+                         !is.na(second_tx_date) & !is.na(tx_date) &
+                         second_tx_date > tx_date &
+                         second_tx_date <= admin_censor,
+      alive_recipient  = transplanted == 1 & !got_second_tx & !died_by_admin,
+      died_post_tx     = transplanted == 1 & !got_second_tx &  died_by_admin,
+      died_pre_tx      = transplanted == 0 &  died_by_admin,
+      alive_waitlisted = transplanted == 0 & !died_by_admin
+    )
+  list(
+    total              = nrow(md),
+    received_tx        = sum(md$transplanted == 1),
+    alive_recipients   = sum(md$alive_recipient),
+    died_post_tx       = sum(md$died_post_tx),
+    got_second_tx      = sum(md$got_second_tx),
+    died_pre_tx        = sum(md$died_pre_tx),
+    alive_waitlisted   = sum(md$alive_waitlisted)
+  )
+}
+cat_pre  <- classify_matched("Pre")
+cat_post <- classify_matched("Post")
+# Sanity checks: categories partition each matched cohort
+stopifnot(cat_pre$received_tx ==
+            cat_pre$alive_recipients + cat_pre$died_post_tx + cat_pre$got_second_tx)
+stopifnot(cat_pre$total == cat_pre$received_tx + cat_pre$died_pre_tx + cat_pre$alive_waitlisted)
+stopifnot(cat_post$received_tx ==
+            cat_post$alive_recipients + cat_post$died_post_tx + cat_post$got_second_tx)
+stopifnot(cat_post$total == cat_post$received_tx + cat_post$died_pre_tx + cat_post$alive_waitlisted)
+
+# Per-(organ, period) eligible and matched counts, listed in the order
+# Heart, Lung, Liver, Kidney to match the existing reporting convention.
+organ_order <- c("Heart", "Lung", "Liver", "Kidney")
+cell_n <- function(lst, organ, period) {
+  key <- paste(organ, period, sep = "_")
+  if (is.null(lst[[key]])) 0L else nrow(lst[[key]])
+}
+per_organ_eligible_pre  <- vapply(organ_order, function(o) cell_n(cohort_out,  o, "Pre"),  integer(1))
+per_organ_eligible_post <- vapply(organ_order, function(o) cell_n(cohort_out,  o, "Post"), integer(1))
+per_organ_matched_pre   <- vapply(organ_order, function(o) cell_n(matched_out, o, "Pre"),  integer(1))
+per_organ_matched_post  <- vapply(organ_order, function(o) cell_n(matched_out, o, "Post"), integer(1))
+
+n_excl_total <- n_excl_multi_total + n_excl_low + n_excl_inact + n_excl_data
+stopifnot(n_excl_total == n_start - n_eligible)
+
+# Eligible-cohort demographics (mean age + % female)
+mean_age_eligible   <- mean(step_eligible$age, na.rm = TRUE)
+n_female_eligible   <- sum(step_eligible$female == 1, na.rm = TRUE)
+pct_female_eligible <- 100 * n_female_eligible / n_eligible
+
+# Same demographics split by policy period (pooled across organs), using the
+# same Pre/Post cohort_out split that drives the eligible-cohort counts.
+pre_eligible_df  <- bind_rows(cohort_out[grepl("_Pre$",  names(cohort_out))])
+post_eligible_df <- bind_rows(cohort_out[grepl("_Post$", names(cohort_out))])
+mean_age_pre   <- mean(pre_eligible_df$age,  na.rm = TRUE)
+mean_age_post  <- mean(post_eligible_df$age, na.rm = TRUE)
+n_female_pre   <- sum(pre_eligible_df$female  == 1, na.rm = TRUE)
+n_female_post  <- sum(post_eligible_df$female == 1, na.rm = TRUE)
+
+fmt_int   <- function(x) comma(x)
+fmt_age   <- function(x) sprintf("%.1f", x)
+fmt_n_pct <- function(n, total) sprintf("%s (%.1f%%)", comma(n),
+                                          100 * n / total)
+
+# Assemble the table
+summary_rows <- tibble(
+  ` ` = c(
+    "Adult candidates listed Aug 2019-Jul 2021 or Aug 2022-Jul 2024",
+    "  Excluded: Multiple organ transplant",
+    "  Excluded: Low-volume transplant center",
+    "  Excluded: Never activated on waiting list",
+    "  Excluded: Data entry error or missing data",
+    "  Total excluded",
+    "Candidate records eligible for study",
+    "  Mean age at listing, years",
+    "  Female, No. (%)",
+    "  Eligible candidate records in pre-policy cohort",
+    "    Mean age at listing, years",
+    "    Female, No. (%)",
+    "    Heart transplant candidates (Pre)",
+    "    Lung transplant candidates (Pre)",
+    "    Liver transplant candidates (Pre)",
+    "    Kidney transplant candidates (Pre)",
+    "  Eligible candidate records in post-policy cohort",
+    "    Mean age at listing, years",
+    "    Female, No. (%)",
+    "    Heart transplant candidates (Post)",
+    "    Lung transplant candidates (Post)",
+    "    Liver transplant candidates (Post)",
+    "    Kidney transplant candidates (Post)",
+    "  Unmatched in pre-policy cohort",
+    "  Unmatched in post-policy cohort",
+    "  Matched candidate records in pre-policy cohort",
+    "    Heart transplant candidates (Pre matched)",
+    "    Lung transplant candidates (Pre matched)",
+    "    Liver transplant candidates (Pre matched)",
+    "    Kidney transplant candidates (Pre matched)",
+    "  Matched candidate records in post-policy cohort",
+    "    Heart transplant candidates (Post matched)",
+    "    Lung transplant candidates (Post matched)",
+    "    Liver transplant candidates (Post matched)",
+    "    Kidney transplant candidates (Post matched)",
+    "Pre-policy matched cohort: received transplant",
+    "  Alive at end of follow-up among transplant recipients",
+    "  Died after receiving transplant by end of follow-up",
+    "  Received a second transplant",
+    "Pre-policy matched cohort: died prior to receiving a transplant",
+    "Pre-policy matched cohort: alive without receiving a transplant at end of follow-up",
+    "Post-policy matched cohort: received transplant",
+    "  Alive at end of follow-up among transplant recipients",
+    "  Died after receiving transplant by end of follow-up",
+    "  Received a second transplant",
+    "Post-policy matched cohort: died prior to receiving a transplant",
+    "Post-policy matched cohort: alive without receiving a transplant at end of follow-up"
+  ),
+  N = c(
+    fmt_int(n_start),
+    fmt_int(n_excl_multi_total),
+    fmt_int(n_excl_low),
+    fmt_int(n_excl_inact),
+    fmt_int(n_excl_data),
+    fmt_int(n_excl_total),
+    fmt_int(n_eligible),
+    fmt_age(mean_age_eligible),
+    fmt_n_pct(n_female_eligible, n_eligible),
+    fmt_int(n_eligible_pre),
+    fmt_age(mean_age_pre),
+    fmt_n_pct(n_female_pre, n_eligible_pre),
+    fmt_int(per_organ_eligible_pre[["Heart"]]),
+    fmt_int(per_organ_eligible_pre[["Lung"]]),
+    fmt_int(per_organ_eligible_pre[["Liver"]]),
+    fmt_int(per_organ_eligible_pre[["Kidney"]]),
+    fmt_int(n_eligible_post),
+    fmt_age(mean_age_post),
+    fmt_n_pct(n_female_post, n_eligible_post),
+    fmt_int(per_organ_eligible_post[["Heart"]]),
+    fmt_int(per_organ_eligible_post[["Lung"]]),
+    fmt_int(per_organ_eligible_post[["Liver"]]),
+    fmt_int(per_organ_eligible_post[["Kidney"]]),
+    fmt_int(n_unmatched_pre),
+    fmt_int(n_unmatched_post),
+    fmt_int(n_matched_pre),
+    fmt_int(per_organ_matched_pre[["Heart"]]),
+    fmt_int(per_organ_matched_pre[["Lung"]]),
+    fmt_int(per_organ_matched_pre[["Liver"]]),
+    fmt_int(per_organ_matched_pre[["Kidney"]]),
+    fmt_int(n_matched_post),
+    fmt_int(per_organ_matched_post[["Heart"]]),
+    fmt_int(per_organ_matched_post[["Lung"]]),
+    fmt_int(per_organ_matched_post[["Liver"]]),
+    fmt_int(per_organ_matched_post[["Kidney"]]),
+    fmt_int(cat_pre$received_tx),
+    fmt_int(cat_pre$alive_recipients),
+    fmt_int(cat_pre$died_post_tx),
+    fmt_int(cat_pre$got_second_tx),
+    fmt_int(cat_pre$died_pre_tx),
+    fmt_int(cat_pre$alive_waitlisted),
+    fmt_int(cat_post$received_tx),
+    fmt_int(cat_post$alive_recipients),
+    fmt_int(cat_post$died_post_tx),
+    fmt_int(cat_post$got_second_tx),
+    fmt_int(cat_post$died_pre_tx),
+    fmt_int(cat_post$alive_waitlisted)
+  )
+)
+
+print(knitr::kable(summary_rows, align = "lr",
+                   caption = "Cohort summary: exclusion cascade, eligibility, matching, and matched-cohort status at admin_censor."))
+
+write.csv(summary_rows, "cohort_summary.csv", row.names = FALSE)
+cat(sprintf("\nWrote cohort_summary.csv (%s rows)\n", nrow(summary_rows)))
+```
+
+# Write per-organ cohort and matched RDS files
+
+```{r save_outputs, dependson="per_organ_match", cache=FALSE}
+# Stack Pre+Post per organ and write to repo root with the same filenames the
+# downstream organ Rmds and Table 1 file already expect.
+analytic_lookup <- list(Heart  = analytic_heart,
+                        Liver  = analytic_liver,
+                        Lung   = analytic_lung,
+                        Kidney = analytic_kidney)
+
+filename_lookup <- c(Heart = "heart", Liver = "liver",
+                     Lung = "lung",   Kidney = "kidney")
+
+for (organ in names(analytic_lookup)) {
+  organ_lc <- filename_lookup[[organ]]
+  cohort_combined  <- bind_rows(cohort_out[[paste(organ, "Pre",  sep = "_")]],
+                                cohort_out[[paste(organ, "Post", sep = "_")]])
+  # matched data needs every column present in the analytic frame (matchit
+  # adds distance/weights/subclass; re-attach the rest from analytic_<organ>)
+  m_info <- function(md, period) {
+    md %>%
+      select(PX_ID, distance, weights, subclass) %>%
+      mutate(cohort = paste0(period, "-Policy"))
+  }
+  matched_combined <- bind_rows(
+    analytic_lookup[[organ]] %>%
+      inner_join(m_info(matched_out[[paste(organ, "Pre",  sep = "_")]], "Pre"),
+                 by = "PX_ID"),
+    analytic_lookup[[organ]] %>%
+      inner_join(m_info(matched_out[[paste(organ, "Post", sep = "_")]], "Post"),
+                 by = "PX_ID")
+  )
+
+  saveRDS(cohort_combined,  file = paste0("cohort_",  organ_lc, ".rds"))
+  saveRDS(matched_combined, file = paste0("matched_", organ_lc, ".rds"))
+
+  cat(sprintf("Wrote cohort_%s.rds (%s rows) and matched_%s.rds (%s rows)\n",
+              organ_lc, comma(nrow(cohort_combined)),
+              organ_lc, comma(nrow(matched_combined))))
+}
+```

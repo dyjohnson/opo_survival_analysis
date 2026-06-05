@@ -1,0 +1,1126 @@
+---
+title: "Table 1 — Matched-Cohort Demographics by Organ and Cohort (Pre- vs. Post-2022 Policy)"
+output:
+  pdf_document:
+    toc: false
+    latex_engine: xelatex
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(tableone)
+library(knitr)
+library(kableExtra)
+```
+
+```{r load_cohorts}
+# Import the entire eligible cohorts
+organs <- c("heart", "lung", "liver", "kidney")
+for (o in organs) {
+  rds <- paste0("cohort_", o, ".rds")
+  if (!file.exists(rds)) {
+    rmd <- paste0("survival_benefit_", o, "_2022.Rmd")
+    message("Knitting ", rmd, " to generate ", rds)
+    knitr::knit(rmd, output = tempfile(), quiet = TRUE)
+  }
+}
+
+read_cohort <- function(o) {
+  readRDS(paste0("cohort_", o, ".rds")) %>%
+    mutate(organ = stringr::str_to_title(o))
+}
+
+# Variables common across all four cohort datasets, plus heart-specific
+# cardiac variables that will be NA for non-heart organs.
+common_vars <- c("PX_ID", "list_date", "transplanted", "tx_date",
+                 "blood_type", "age", "region",
+                 "female", "bmi",
+                 "race_white", "race_black", "race_asian", "race_other",
+                 "race_hispanic", "ethnicity",
+                 "insurance",
+                 "diabetes", "egfr", "renal_function", "functional_status",
+                 # heart-specific (NA for non-heart organs)
+                 "diagnosis", "pcwp_mean", "pa_mean", "cardiac_index",
+                 "pcwp_15", "severe_impairment",
+                 # organ-specific extras for the organ-specific characteristics table
+                 "init_status",                  # heart, lung, liver
+                 "vad", "ecmo", "iabp",          # heart
+                 "meld_init",                    # liver
+                 "dialysis_days",                # kidney
+                 "dgn_code", "diag",             # raw CAN_DGN code (heart/lung use dgn_code; liver/kidney use diag)
+                 "on_dialysis", "tier19",
+                 "dead_1y", "follow_days_1y",
+                 "cohort", "organ")
+
+cand_all <- bind_rows(lapply(organs, function(o) {
+  read_cohort(o) %>% select(any_of(common_vars))
+})) %>%
+  mutate(
+    # Sentinel/garbage values exist in CAN_BMI; constrain to physiologic range.
+    bmi           = ifelse(bmi >= 10 & bmi <= 80, bmi, NA_real_),
+    organ         = factor(organ, levels = c("Heart", "Lung", "Liver", "Kidney")),
+    cohort        = factor(cohort, levels = c("Pre-Policy", "Post-Policy")),
+    organ_cohort  = factor(paste(organ, cohort, sep = " — "),
+                           levels = c("Heart — Pre-Policy",  "Heart — Post-Policy",
+                                      "Lung — Pre-Policy",   "Lung — Post-Policy",
+                                      "Liver — Pre-Policy",  "Liver — Post-Policy",
+                                      "Kidney — Pre-Policy", "Kidney — Post-Policy")),
+    blood_type    = factor(blood_type, levels = c("O", "A", "B", "AB")),
+    female        = factor(female,        levels = c(0, 1), labels = c("Male", "Female")),
+    race_white    = factor(race_white,    levels = c(0, 1), labels = c("No", "Yes")),
+    race_black    = factor(race_black,    levels = c(0, 1), labels = c("No", "Yes")),
+    race_asian    = factor(race_asian,    levels = c(0, 1), labels = c("No", "Yes")),
+    race_other    = factor(race_other,    levels = c(0, 1), labels = c("No", "Yes")),
+    race_hispanic = factor(race_hispanic, levels = c(0, 1), labels = c("No", "Yes")),
+    ethnicity     = factor(ethnicity,
+                           levels = c("Hispanic", "Non-Hispanic", "Other")),
+    insurance     = factor(insurance,
+                           levels = c("Private", "Medicare", "Medicaid", "Other")),
+    diabetes      = factor(diabetes,
+                           levels = c("Non-diabetic", "History of DM", "Unknown")),
+    renal_function = factor(renal_function,
+                            levels = c("GFR >= 60", "GFR 30-59", "GFR < 30",
+                                       "Dialysis", "Unknown")),
+    functional_status = factor(functional_status,
+                               levels = c("Limited Impairment, 10-30%",
+                                          "Moderate Impairment, 40-60%",
+                                          "Severe Impairment, 70-100%",
+                                          "Unknown")),
+    on_dialysis   = factor(on_dialysis,   levels = c(0, 1), labels = c("No", "Yes")),
+    transplanted  = factor(transplanted,  levels = c(0, 1),
+                           labels = c("Waitlisted", "Transplanted")),
+    dead_1y       = factor(dead_1y,       levels = c(0, 1),
+                           labels = c("Survived 1 year", "Died within 1 year")),
+    # heart-specific binary indicators (NA for non-heart organs)
+    pcwp_15           = factor(pcwp_15,           levels = c(0, 1), labels = c("No", "Yes")),
+    severe_impairment = factor(severe_impairment, levels = c(0, 1), labels = c("No", "Yes")),
+    diagnosis         = factor(diagnosis,
+                               levels = c("Dilated", "Ischemic", "Restrictive", "Other")),
+    # Mutually exclusive race/ethnicity: Hispanic absorbs all Latino candidates;
+    # remaining candidates classify by primary race in priority White > Black > Other.
+    race_eth = factor(case_when(
+      race_hispanic == "Yes" ~ "Hispanic",
+      race_white    == "Yes" ~ "White",
+      race_black    == "Yes" ~ "Black",
+      TRUE                   ~ "Other"
+    ), levels = c("White", "Black", "Hispanic", "Other"))
+  )
+
+cat("Eligible candidates by organ x cohort:\n")
+print(table(cand_all$organ, cand_all$cohort))
+```
+
+```{r table1}
+# Helpers for cell formatting.
+ms <- function(x) {
+  if (all(is.na(x))) return("")
+  sprintf("%.1f (%.1f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+}
+np <- function(n, total) {
+  if (total == 0) return("")
+  sprintf("%s (%.1f)", format(n, big.mark = ","), 100 * n / total)
+}
+cnt <- function(n) format(n, big.mark = ",")
+
+make_col <- function(d) {
+  total <- nrow(d)
+  c(
+    `N`                                        = cnt(nrow(d)),
+    `Age at listing, mean (SD), years`         = ms(d$age),
+    `Female sex, No. (%)`                      = np(sum(d$female == "Female", na.rm = TRUE), total),
+    `Race/ethnicity, No. (%)`                  = "",
+    `  White`                                  = np(sum(d$race_eth == "White",    na.rm = TRUE), total),
+    `  Black`                                  = np(sum(d$race_eth == "Black",    na.rm = TRUE), total),
+    `  Hispanic`                               = np(sum(d$race_eth == "Hispanic", na.rm = TRUE), total),
+    `  Other`                                  = np(sum(d$race_eth == "Other",    na.rm = TRUE), total),
+    `Primary payer, No. (%)`                   = "",
+    `Private insurance`                        = np(sum(d$insurance == "Private",  na.rm = TRUE), total),
+    `Medicare`                                 = np(sum(d$insurance == "Medicare", na.rm = TRUE), total),
+    `Medicaid`                                 = np(sum(d$insurance == "Medicaid", na.rm = TRUE), total),
+    `Other`                                    = np(sum(d$insurance == "Other",    na.rm = TRUE), total),
+    `Body mass index, mean (SD), kg/m²`   = ms(d$bmi),
+    `Functional status (Karnofsky), No. (%)`   = "",
+    `  Limited impairment (10%–30%)`      = np(sum(d$functional_status == "Limited Impairment, 10-30%",  na.rm = TRUE), total),
+    `  Moderate impairment (40%–60%)`     = np(sum(d$functional_status == "Moderate Impairment, 40-60%", na.rm = TRUE), total),
+    `  Severe impairment (70%–100%)`      = np(sum(d$functional_status == "Severe Impairment, 70-100%", na.rm = TRUE), total),
+    `  Unknown`                                = np(sum(d$functional_status == "Unknown",                    na.rm = TRUE), total),
+    `Blood type (ABO), No. (%)`                = "",
+    `A`                                        = np(sum(d$blood_type == "A",  na.rm = TRUE), total),
+    `B`                                        = np(sum(d$blood_type == "B",  na.rm = TRUE), total),
+    `AB`                                       = np(sum(d$blood_type == "AB", na.rm = TRUE), total),
+    `O`                                        = np(sum(d$blood_type == "O",  na.rm = TRUE), total),
+    `Region of listing, No. (%)`               = "",
+    `Region 1`                                 = np(sum(d$region ==  "1", na.rm = TRUE), total),
+    `Region 2`                                 = np(sum(d$region ==  "2", na.rm = TRUE), total),
+    `Region 3`                                 = np(sum(d$region ==  "3", na.rm = TRUE), total),
+    `Region 4`                                 = np(sum(d$region ==  "4", na.rm = TRUE), total),
+    `Region 5`                                 = np(sum(d$region ==  "5", na.rm = TRUE), total),
+    `Region 6`                                 = np(sum(d$region ==  "6", na.rm = TRUE), total),
+    `Region 7`                                 = np(sum(d$region ==  "7", na.rm = TRUE), total),
+    `Region 8`                                 = np(sum(d$region ==  "8", na.rm = TRUE), total),
+    `Region 9`                                 = np(sum(d$region ==  "9", na.rm = TRUE), total),
+    `Region 10`                                = np(sum(d$region == "10", na.rm = TRUE), total),
+    `Region 11`                                = np(sum(d$region == "11", na.rm = TRUE), total),
+    `Transplanted within study period, No. (%)`= np(sum(d$transplanted == "Transplanted", na.rm = TRUE), total)
+  )
+}
+
+cohort_keys <- list(
+  heart_pre  = c("Heart",  "Pre-Policy"),
+  heart_post = c("Heart",  "Post-Policy"),
+  lung_pre   = c("Lung",   "Pre-Policy"),
+  lung_post  = c("Lung",   "Post-Policy"),
+  liver_pre  = c("Liver",  "Pre-Policy"),
+  liver_post = c("Liver",  "Post-Policy"),
+  kidney_pre = c("Kidney", "Pre-Policy"),
+  kidney_post= c("Kidney", "Post-Policy")
+)
+
+cols <- lapply(cohort_keys, function(k) {
+  make_col(cand_all %>% filter(organ == k[1], cohort == k[2]))
+})
+
+row_labels <- names(cols[[1]])
+section_labels <- c(
+  "Race/ethnicity, No. (%)",
+  "Primary payer, No. (%)",
+  "Functional status (Karnofsky), No. (%)",
+  "Blood type (ABO), No. (%)",
+  "Region of listing, No. (%)"
+)
+
+table1_df <- data.frame(
+  row_type   = ifelse(row_labels %in% section_labels, "section", "data"),
+  row_label  = row_labels,
+  heart_pre  = cols$heart_pre,
+  heart_post = cols$heart_post,
+  lung_pre   = cols$lung_pre,
+  lung_post  = cols$lung_post,
+  liver_pre  = cols$liver_pre,
+  liver_post = cols$liver_post,
+  kidney_pre = cols$kidney_pre,
+  kidney_post= cols$kidney_post,
+  row.names  = NULL,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+write.csv(table1_df, "table_1_2022.csv", row.names = FALSE)
+
+# Per-organ Pre-vs-Post p-values aligned to table1_df's row order. Continuous
+# variables use Student's two-sample t-test; categorical variables use a Pearson 
+# chi-square.
+fmt_p <- function(p) {
+  if (is.na(p))      return("")
+  if (p < 0.001)     return("<0.001")
+  if (p < 0.01)      return(sprintf("%.3f", p))
+  sprintf("%.2f", p)
+}
+p_cont <- function(d_pre, d_post, var) {
+  pre <- d_pre[[var]]; post <- d_post[[var]]
+  if (sum(!is.na(pre)) < 2 || sum(!is.na(post)) < 2) return(NA_real_)
+  tryCatch(t.test(pre, post, var.equal = TRUE)$p.value,
+           error = function(e) NA_real_)
+}
+p_cat <- function(d_pre, d_post, var) {
+  combined <- c(as.character(d_pre[[var]]),  as.character(d_post[[var]]))
+  group    <- c(rep("pre",  nrow(d_pre)),    rep("post", nrow(d_post)))
+  tab <- table(combined, group)
+  if (any(dim(tab) < 2)) return(NA_real_)
+  tryCatch(suppressWarnings(chisq.test(tab, correct = FALSE))$p.value,
+           error = function(e) NA_real_)
+}
+
+make_pval_col <- function(d_pre, d_post) {
+  c(
+    `N`                                        = "",
+    `Age at listing, mean (SD), years`         = fmt_p(p_cont(d_pre, d_post, "age")),
+    `Female sex, No. (%)`                      = fmt_p(p_cat (d_pre, d_post, "female")),
+    `Race/ethnicity, No. (%)`                  = fmt_p(p_cat (d_pre, d_post, "race_eth")),
+    `  White`                                  = "",
+    `  Black`                                  = "",
+    `  Hispanic`                               = "",
+    `  Other`                                  = "",
+    `Primary payer, No. (%)`                   = fmt_p(p_cat (d_pre, d_post, "insurance")),
+    `Private insurance`                        = "",
+    `Medicare`                                 = "",
+    `Medicaid`                                 = "",
+    `Other`                                    = "",
+    `Body mass index, mean (SD), kg/m²`        = fmt_p(p_cont(d_pre, d_post, "bmi")),
+    `Functional status (Karnofsky), No. (%)`   = fmt_p(p_cat (d_pre, d_post, "functional_status")),
+    `  Limited impairment (10%–30%)`           = "",
+    `  Moderate impairment (40%–60%)`          = "",
+    `  Severe impairment (70%–100%)`           = "",
+    `  Unknown`                                = "",
+    `Blood type (ABO), No. (%)`                = fmt_p(p_cat (d_pre, d_post, "blood_type")),
+    `A`                                        = "",
+    `B`                                        = "",
+    `AB`                                       = "",
+    `O`                                        = "",
+    `Region of listing, No. (%)`               = fmt_p(p_cat (d_pre, d_post, "region")),
+    `Region 1`                                 = "",
+    `Region 2`                                 = "",
+    `Region 3`                                 = "",
+    `Region 4`                                 = "",
+    `Region 5`                                 = "",
+    `Region 6`                                 = "",
+    `Region 7`                                 = "",
+    `Region 8`                                 = "",
+    `Region 9`                                 = "",
+    `Region 10`                                = "",
+    `Region 11`                                = "",
+    `Transplanted within study period, No. (%)`= fmt_p(p_cat (d_pre, d_post, "transplanted"))
+  )
+}
+
+p_cols <- lapply(c("Heart", "Lung", "Liver", "Kidney"), function(o) {
+  make_pval_col(
+    cand_all %>% filter(organ == o, cohort == "Pre-Policy"),
+    cand_all %>% filter(organ == o, cohort == "Post-Policy")
+  )
+})
+names(p_cols) <- c("heart_p", "lung_p", "liver_p", "kidney_p")
+
+# Sanity check: each p-value vector must align row-for-row with table1_df.
+stopifnot(all(vapply(p_cols, length, integer(1)) == nrow(table1_df)))
+
+overall_col      <- make_col(cand_all)
+overall_pre_col  <- make_col(cand_all %>% filter(cohort == "Pre-Policy"))
+overall_post_col <- make_col(cand_all %>% filter(cohort == "Post-Policy"))
+stopifnot(length(overall_col)      == nrow(table1_df),
+          length(overall_pre_col)  == nrow(table1_df),
+          length(overall_post_col) == nrow(table1_df))
+
+table1_pvalues_df <- table1_df %>%
+  mutate(heart_p      = p_cols$heart_p,
+         lung_p       = p_cols$lung_p,
+         liver_p      = p_cols$liver_p,
+         kidney_p     = p_cols$kidney_p,
+         overall      = overall_col,
+         overall_pre  = overall_pre_col,
+         overall_post = overall_post_col) %>%
+  select(row_type, row_label,
+         heart_pre, heart_post, heart_p,
+         lung_pre,  lung_post,  lung_p,
+         liver_pre, liver_post, liver_p,
+         kidney_pre, kidney_post, kidney_p,
+         overall, overall_pre, overall_post)
+
+write.csv(table1_pvalues_df, "table_1_2022_pvalues.csv", row.names = FALSE)
+
+kable(
+  table1_df %>% select(-row_type),
+  format    = "latex",
+  booktabs  = TRUE,
+  col.names = c(" ",
+                "Heart Pre", "Heart Post",
+                "Lung Pre",  "Lung Post",
+                "Liver Pre", "Liver Post",
+                "Kidney Pre","Kidney Post"),
+  caption   = paste("Table 1. Eligible-cohort candidate characteristics by organ",
+                    "and cohort. Pre-Policy: Aug 2019–Jul 2021;",
+                    "Post-Policy: Aug 2022–Jul 2024."),
+  linesep   = ""
+) %>%
+  kable_styling(
+    latex_options = c("striped", "hold_position"),
+    font_size     = 7
+  ) %>%
+  landscape() %>%
+  add_footnote(
+    c(
+      "Continuous variables: mean (SD). Categorical variables: No. (%).",
+      paste("Race/ethnicity is mutually exclusive: any candidate marked Hispanic",
+            "is classified as Hispanic; remaining classify as White, Black, or",
+            "Other (includes Asian / multi-race / unknown)."),
+      paste("Includes the entire eligible cohort (post-NA filter on matching",
+            "covariates) defined by each survival_benefit_<organ>_2022.Rmd,",
+            "before 1:1 propensity-score matching."),
+      paste("Cohorts and inclusion criteria match those in",
+            "survival_benefit_<organ>_2022.Rmd: adult candidates",
+            "(age > 17), single-organ only.")
+    ),
+    notation        = "none",
+    threeparttable  = TRUE
+  )
+```
+
+```{r organ_specific_characteristics}
+# Organ-specific characteristics for the entire eligible cohorts.
+# Diagnosis sub-categories use the SRTR Diagnosis Group mappings provided in
+# heart_dgn_groups.xlsx, lung_dgn_groups.xlsx, liver_dgn_groups.xlsx, and
+# kidney_dgn_groups.xlsx. Heart and lung pull raw CAN_DGN via `dgn_code`; liver
+# and kidney use the existing `diag` column.
+
+library(readxl)
+
+read_dgn_map <- function(organ) {
+  read_excel(paste0(organ, "_dgn_groups.xlsx")) %>%
+    transmute(dgn_code = as.character(`OPTN Diagnosis Code`),
+              group    = `SRTR Diagnosis Group`)
+}
+
+dgn_maps <- list(
+  Heart  = read_dgn_map("heart"),
+  Lung   = read_dgn_map("lung"),
+  Liver  = read_dgn_map("liver"),
+  Kidney = read_dgn_map("kidney")
+)
+
+# Standardize the per-row diagnosis code: heart and lung have `dgn_code`,
+# liver and kidney have `diag`. After bind_rows in load_cohorts, both columns
+# exist with NA in non-applicable rows. Coalesce into a single column.
+cand_all <- cand_all %>%
+  mutate(dgn_code_unified = coalesce(as.character(dgn_code), as.character(diag)))
+
+# Cell formatters
+ms <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return("")
+  sprintf("%.1f (%.1f)", mean(x), sd(x))
+}
+np <- function(n, total) {
+  if (total == 0 || is.na(total)) return("")
+  sprintf("%s (%.1f)", format(n, big.mark = ","), 100 * n / total)
+}
+cnt <- function(n) format(n, big.mark = ",")
+
+strip_organ_prefix <- function(s) sub("^[^:]+:\\s*", "", s)
+
+order_diag_groups <- function(groups_all, d_g) {
+  counts <- vapply(groups_all, function(g) sum(d_g$group == g, na.rm = TRUE),
+                   integer(1))
+  is_other <- grepl(":\\s*Other$", groups_all)
+  groups_all[order(is_other, -counts)]
+}
+
+# Per-organ row builders. Each returns a tibble with row_type, row_label, value.
+# `groups` is the diagnosis-group ordering (computed once on combined Pre+Post
+# data by `make_organ_block`) so Pre and Post row orderings stay aligned.
+make_heart_rows <- function(d, groups) {
+  total <- nrow(d)
+  d_g   <- d %>% left_join(dgn_maps$Heart, by = c("dgn_code_unified" = "dgn_code"))
+
+  status_codes <- c("2110", "2120", "2130", "2140", "2150", "2160")
+  status_pct <- vapply(status_codes, function(s)
+    np(sum(d$init_status == s, na.rm = TRUE), total), character(1))
+  status7 <- np(sum(d$init_status %in% c("2999", "2010", "2020"), na.rm = TRUE), total)
+
+  diag_pct <- vapply(groups, function(g)
+    np(sum(d_g$group == g, na.rm = TRUE), total), character(1))
+
+  tibble(
+    row_type  = c("data", "section", rep("data", 7),
+                  "section", rep("data", length(groups)),
+                  "data", "data", "data"),
+    row_label = c("N",
+                  "Status at listing, No. (%)",
+                  paste0("  Status ", 1:6), "  Status 7 (Inactive)",
+                  "Diagnosis, No. (%)",
+                  paste0("  ", strip_organ_prefix(groups)),
+                  "Ventricular assist device at listing, No. (%)",
+                  "ECMO at listing, No. (%)",
+                  "Intra-aortic balloon pump at listing, No. (%)"),
+    value     = c(cnt(total), "",
+                  status_pct, status7,
+                  "",
+                  diag_pct,
+                  np(sum(d$vad  == 1, na.rm = TRUE), total),
+                  np(sum(d$ecmo == 1, na.rm = TRUE), total),
+                  np(sum(d$iabp == 1, na.rm = TRUE), total))
+  )
+}
+
+make_lung_rows <- function(d, groups) {
+  total <- nrow(d)
+  d_g   <- d %>% left_join(dgn_maps$Lung, by = c("dgn_code_unified" = "dgn_code"))
+  diag_pct <- vapply(groups, function(g)
+    np(sum(d_g$group == g, na.rm = TRUE), total), character(1))
+
+  tibble(
+    row_type  = c("data", "data",
+                  "section", rep("data", length(groups))),
+    row_label = c("N",
+                  "Active list at listing, No. (%)",
+                  "Diagnosis, No. (%)",
+                  paste0("  ", strip_organ_prefix(groups))),
+    value     = c(cnt(total),
+                  np(sum(d$init_status == "7010", na.rm = TRUE), total),
+                  "",
+                  diag_pct)
+  )
+}
+
+make_liver_rows <- function(d, groups) {
+  total <- nrow(d)
+  d_g   <- d %>% left_join(dgn_maps$Liver, by = c("dgn_code_unified" = "dgn_code"))
+  diag_pct <- vapply(groups, function(g)
+    np(sum(d_g$group == g, na.rm = TRUE), total), character(1))
+
+  tibble(
+    row_type  = c("data",
+                  "section", rep("data", 3),
+                  "data", "data",
+                  "section", rep("data", length(groups))),
+    row_label = c("N",
+                  "Status at listing, No. (%)",
+                  "  Status 1A", "  Status 1B", "  Status 2 (MELD)",
+                  "MELD score at listing, mean (SD)",
+                  "Hemodialysis at listing, No. (%)",
+                  "Diagnosis, No. (%)",
+                  paste0("  ", strip_organ_prefix(groups))),
+    value     = c(cnt(total),
+                  "",
+                  np(sum(d$init_status == "6011", na.rm = TRUE), total),
+                  np(sum(d$init_status == "6012", na.rm = TRUE), total),
+                  np(sum(d$init_status %in% as.character(6206:6240), na.rm = TRUE), total),
+                  ms(d$meld_init),
+                  np(sum(d$on_dialysis == "Yes", na.rm = TRUE), total),
+                  "",
+                  diag_pct)
+  )
+}
+
+make_kidney_rows <- function(d, groups) {
+  total <- nrow(d)
+  d_g   <- d %>% left_join(dgn_maps$Kidney, by = c("dgn_code_unified" = "dgn_code"))
+  diag_pct <- vapply(groups, function(g)
+    np(sum(d_g$group == g, na.rm = TRUE), total), character(1))
+
+  # Years on dialysis among candidates currently on dialysis with a known start date
+  yrs_on_dial <- d %>%
+    filter(on_dialysis == "Yes", dialysis_days > 0) %>%
+    pull(dialysis_days) / 365.25
+
+  tibble(
+    row_type  = c("data", "data", "data",
+                  "section", rep("data", length(groups))),
+    row_label = c("N",
+                  "Dialysis at listing, No. (%)",
+                  "Years on dialysis at listing, mean (SD)",
+                  "Diagnosis, No. (%)",
+                  paste0("  ", strip_organ_prefix(groups))),
+    value     = c(cnt(total),
+                  np(sum(d$on_dialysis == "Yes", na.rm = TRUE), total),
+                  ms(yrs_on_dial),
+                  "",
+                  diag_pct)
+  )
+}
+
+# Per-organ Pre-vs-Post p-values. Continuous variables use Student's two-sample
+# t-test; categorical variables use Pearson chi-square.
+p_cont_vec <- function(pre, post) {
+  if (sum(!is.na(pre)) < 2 || sum(!is.na(post)) < 2) return(NA_real_)
+  tryCatch(t.test(pre, post, var.equal = TRUE)$p.value,
+           error = function(e) NA_real_)
+}
+p_cat_vec <- function(pre, post) {
+  pre <- as.character(pre); post <- as.character(post)
+  combined <- c(pre, post)
+  group    <- c(rep("pre", length(pre)), rep("post", length(post)))
+  keep <- !is.na(combined)
+  tab <- table(combined[keep], group[keep])
+  if (any(dim(tab) < 2)) return(NA_real_)
+  tryCatch(suppressWarnings(chisq.test(tab, correct = FALSE))$p.value,
+           error = function(e) NA_real_)
+}
+
+heart_status_bucket <- function(codes) {
+  case_when(
+    codes == "2110" ~ "1", codes == "2120" ~ "2",
+    codes == "2130" ~ "3", codes == "2140" ~ "4",
+    codes == "2150" ~ "5", codes == "2160" ~ "6",
+    codes %in% c("2999", "2010", "2020") ~ "7",
+    TRUE ~ NA_character_
+  )
+}
+liver_status_bucket <- function(codes) {
+  case_when(
+    codes == "6011" ~ "1A",
+    codes == "6012" ~ "1B",
+    codes %in% as.character(6206:6240) ~ "2-MELD",
+    TRUE ~ NA_character_
+  )
+}
+
+join_groups <- function(d, dgn_map, groups) {
+  d_g <- d %>% left_join(dgn_map, by = c("dgn_code_unified" = "dgn_code"))
+  d_g$group <- ifelse(d_g$group %in% groups, d_g$group, NA_character_)
+  d_g$group
+}
+
+make_heart_pvals <- function(d_pre, d_post, groups) {
+  c(
+    "",                                                                  # N
+    fmt_p(p_cat_vec(heart_status_bucket(d_pre$init_status),
+                    heart_status_bucket(d_post$init_status))),           # Status header
+    rep("", 7),                                                          # Status 1-7 sub-rows
+    fmt_p(p_cat_vec(join_groups(d_pre,  dgn_maps$Heart, groups),
+                    join_groups(d_post, dgn_maps$Heart, groups))),       # Diagnosis header
+    rep("", length(groups)),                                             # Diagnosis sub-rows
+    fmt_p(p_cat_vec(d_pre$vad,  d_post$vad)),                            # VAD
+    fmt_p(p_cat_vec(d_pre$ecmo, d_post$ecmo)),                           # ECMO
+    fmt_p(p_cat_vec(d_pre$iabp, d_post$iabp))                            # IABP
+  )
+}
+
+make_lung_pvals <- function(d_pre, d_post, groups) {
+  c(
+    "",                                                                  # N
+    fmt_p(p_cat_vec(d_pre$init_status  == "7010",
+                    d_post$init_status == "7010")),                      # Active list
+    fmt_p(p_cat_vec(join_groups(d_pre,  dgn_maps$Lung, groups),
+                    join_groups(d_post, dgn_maps$Lung, groups))),        # Diagnosis header
+    rep("", length(groups))                                              # Diagnosis sub-rows
+  )
+}
+
+make_liver_pvals <- function(d_pre, d_post, groups) {
+  c(
+    "",                                                                  # N
+    fmt_p(p_cat_vec(liver_status_bucket(d_pre$init_status),
+                    liver_status_bucket(d_post$init_status))),           # Status header
+    "", "", "",                                                          # Status 1A/1B/2-MELD
+    fmt_p(p_cont_vec(d_pre$meld_init,   d_post$meld_init)),              # MELD
+    fmt_p(p_cat_vec(d_pre$on_dialysis,  d_post$on_dialysis)),            # Hemodialysis
+    fmt_p(p_cat_vec(join_groups(d_pre,  dgn_maps$Liver, groups),
+                    join_groups(d_post, dgn_maps$Liver, groups))),       # Diagnosis header
+    rep("", length(groups))                                              # Diagnosis sub-rows
+  )
+}
+
+make_kidney_pvals <- function(d_pre, d_post, groups) {
+  yrs_pre  <- d_pre  %>% filter(on_dialysis == "Yes", dialysis_days > 0) %>%
+                pull(dialysis_days) / 365.25
+  yrs_post <- d_post %>% filter(on_dialysis == "Yes", dialysis_days > 0) %>%
+                pull(dialysis_days) / 365.25
+  c(
+    "",                                                                  # N
+    fmt_p(p_cat_vec(d_pre$on_dialysis, d_post$on_dialysis)),             # Dialysis
+    fmt_p(p_cont_vec(yrs_pre, yrs_post)),                                # Years on dialysis
+    fmt_p(p_cat_vec(join_groups(d_pre,  dgn_maps$Kidney, groups),
+                    join_groups(d_post, dgn_maps$Kidney, groups))),      # Diagnosis header
+    rep("", length(groups))                                              # Diagnosis sub-rows
+  )
+}
+
+make_organ_block <- function(organ_name, builder_fn, pvals_fn, dgn_map,
+                             drop_groups = character()) {
+  organ_d   <- cand_all %>% filter(organ == organ_name)
+  organ_d_g <- organ_d %>% left_join(dgn_map, by = c("dgn_code_unified" = "dgn_code"))
+  groups_all <- setdiff(unique(dgn_map$group), drop_groups)
+  groups <- order_diag_groups(groups_all, organ_d_g)
+
+  d_pre  <- organ_d %>% filter(cohort == "Pre-Policy")
+  d_post <- organ_d %>% filter(cohort == "Post-Policy")
+  pre   <- builder_fn(d_pre,  groups)
+  post  <- builder_fn(d_post, groups)
+  pvals <- pvals_fn(d_pre, d_post, groups)
+  stopifnot(length(pvals) == nrow(pre))
+
+  body <- pre %>%
+    rename(pre_policy = value) %>%
+    mutate(post_policy = post$value,
+           p           = pvals) %>%
+    select(row_type, row_label, pre_policy, post_policy, p)
+  bind_rows(
+    tibble(row_type = "section", row_label = organ_name,
+           pre_policy = "", post_policy = "", p = ""),
+    body
+  )
+}
+
+organ_chars_df <- bind_rows(
+  make_organ_block("Heart",  make_heart_rows,  make_heart_pvals,  dgn_maps$Heart),
+  # Drop the Congenital Disease group from the displayed lung diagnoses.
+  make_organ_block("Lung",   make_lung_rows,   make_lung_pvals,   dgn_maps$Lung,
+                   drop_groups = grep("Congenital",
+                                      unique(dgn_maps$Lung$group),
+                                      value = TRUE)),
+  make_organ_block("Liver",  make_liver_rows,  make_liver_pvals,  dgn_maps$Liver),
+  make_organ_block("Kidney", make_kidney_rows, make_kidney_pvals, dgn_maps$Kidney)
+)
+
+write.csv(organ_chars_df, "organ_specific_characteristics.csv", row.names = FALSE)
+
+kable(
+  organ_chars_df %>% select(-row_type),
+  format    = "latex",
+  booktabs  = TRUE,
+  col.names = c(" ", "Pre-Policy", "Post-Policy", "p"),
+  caption   = paste("Organ-specific characteristics of eligible-cohort",
+                    "candidates by policy period. Pre-Policy: Aug 2019–Jul 2021;",
+                    "Post-Policy: Aug 2022–Jul 2024. Diagnosis sub-categories",
+                    "use the SRTR Diagnosis Group mappings."),
+  linesep   = ""
+) %>%
+  kable_styling(latex_options = c("striped", "hold_position"), font_size = 8) %>%
+  add_footnote(
+    c("Continuous variables: mean (SD). Categorical variables: No. (%).",
+      "Heart Status 7 collapses 2999 (Inactive) and the rare leftover 2010/2020 codes.",
+      paste("Liver Status 2 (MELD) covers init_status codes 6206–6240.",
+            "Status 1B is rare in the post-MELD era and may be 0."),
+      "Kidney 'Years on dialysis at listing' restricts to candidates currently on dialysis with dialysis_days > 0.",
+      "Diagnosis sub-categories use the SRTR Diagnosis Group from the *_dgn_groups.xlsx files."),
+    notation = "none", threeparttable = TRUE
+  )
+```
+
+```{r cuminc_at_12mo}
+# Cumulative incidence of transplantation at 12 months (365 days) with 95% CI
+# per (organ x cohort).
+# This is the t = 365 d point estimate from the cumulative-incidence curves
+# rendered in each organ's `cuminc_transplant` chunk.
+library(survival)
+
+cif_at_12mo <- function(d) {
+  d <- d %>%
+    mutate(
+      days_to_tx   = as.numeric(tx_date - list_date),
+      tx_within_1y = !is.na(days_to_tx) & days_to_tx <= 365 & days_to_tx >= 0,
+      time         = if_else(tx_within_1y, days_to_tx, pmin(follow_days_1y, 365)),
+      event        = case_when(
+        tx_within_1y                                       ~ "transplant",
+        dead_1y == "Died within 1 year" & !tx_within_1y    ~ "death",
+        TRUE                                               ~ "censor"
+      ),
+      event = factor(event, levels = c("censor", "transplant", "death"))
+    ) %>%
+    filter(time > 0)
+
+  fit <- survfit(Surv(time, event) ~ 1, data = d)
+  s   <- summary(fit, times = 365, extend = TRUE)
+  state_idx <- which(s$states == "transplant")
+
+  tibble(
+    n       = nrow(d),
+    cif_est = s$pstate[1, state_idx],
+    cif_lo  = s$lower[1,  state_idx],
+    cif_hi  = s$upper[1,  state_idx]
+  )
+}
+
+cuminc_12mo_tbl <- cand_all %>%
+  group_by(organ, cohort) %>%
+  group_modify(~ cif_at_12mo(.x)) %>%
+  ungroup() %>%
+  mutate(
+    `CIF at 12 mo (95% CI)` = sprintf("%.1f%% (%.1f%%, %.1f%%)",
+                                       100 * cif_est, 100 * cif_lo, 100 * cif_hi)
+  ) %>%
+  transmute(Organ  = organ,
+            Cohort = cohort,
+            N      = format(n, big.mark = ","),
+            `CIF at 12 mo (95% CI)`)
+
+write.csv(cuminc_12mo_tbl, "cuminc_at_12mo.csv", row.names = FALSE)
+
+kable(
+  cuminc_12mo_tbl,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = paste("Cumulative incidence of transplantation at 12 months",
+                    "from listing (Aalen-Johansen estimator, with death as a",
+                    "competing event), by organ and policy period. Eligible",
+                    "cohorts.")
+) %>%
+  kable_styling(latex_options = c("striped", "hold_position"), font_size = 9)
+```
+
+```{r matched_table_helpers}
+# Helpers shared by the matched-cohort waitlist-vs-recipient tables.
+
+fmt_smd <- function(s) {
+  if (is.na(s)) return("")
+  sprintf("%.3f", s)
+}
+
+# SMD for a continuous variable across waitlist vs recipient.
+smd_cont <- function(d, var) {
+  x <- d[[var]][d$transplanted == "Waitlist"]
+  y <- d[[var]][d$transplanted == "Recipient"]
+  if (sum(!is.na(x)) < 2 || sum(!is.na(y)) < 2) return(NA_real_)
+  m_x <- mean(x, na.rm = TRUE); v_x <- var(x, na.rm = TRUE)
+  m_y <- mean(y, na.rm = TRUE); v_y <- var(y, na.rm = TRUE)
+  s   <- sqrt((v_x + v_y) / 2)
+  if (is.na(s) || s == 0) return(NA_real_)
+  (m_y - m_x) / s
+}
+
+# SMD for a binary indicator (var == level) across waitlist vs recipient.
+smd_bin <- function(d, var, level) {
+  x   <- d[[var]][d$transplanted == "Waitlist"]
+  y   <- d[[var]][d$transplanted == "Recipient"]
+  p_x <- mean(x == level, na.rm = TRUE)
+  p_y <- mean(y == level, na.rm = TRUE)
+  s   <- sqrt((p_x * (1 - p_x) + p_y * (1 - p_y)) / 2)
+  if (is.na(s) || s == 0) return(NA_real_)
+  (p_y - p_x) / s
+}
+
+# Multivariate SMD across all levels of a categorical var (Yang & Dalton 2012,
+# the tableone default). Returns a non-negative magnitude. Falls back to the
+# max per-level SMD if the level-proportion covariance matrix is singular.
+smd_cat <- function(d, var) {
+  v   <- d[[var]]
+  arm <- d$transplanted
+  keep <- !is.na(v) & !is.na(arm)
+  v <- v[keep]; arm <- arm[keep]
+  if (length(v) == 0) return(NA_real_)
+  lv <- levels(factor(v))
+  if (length(lv) < 2) return(NA_real_)
+  pT <- as.numeric(table(factor(v[arm == "Recipient"], levels = lv)))
+  pT <- pT / sum(pT)
+  pC <- as.numeric(table(factor(v[arm == "Waitlist"],  levels = lv)))
+  pC <- pC / sum(pC)
+  k  <- length(lv)
+  if (k == 2) {
+    p_t <- pT[2]; p_c <- pC[2]
+    s   <- sqrt((p_t * (1 - p_t) + p_c * (1 - p_c)) / 2)
+    if (is.na(s) || s == 0) return(NA_real_)
+    return(abs(p_t - p_c) / s)
+  }
+  # Multi-category: drop the last level (linear dependence) and apply Mahalanobis.
+  pT_k  <- pT[-k]; pC_k  <- pC[-k]
+  p_avg <- (pT_k + pC_k) / 2
+  S     <- diag(p_avg, nrow = length(p_avg)) - outer(p_avg, p_avg)
+  d_vec <- pT_k - pC_k
+  smd_sq <- tryCatch(
+    as.numeric(t(d_vec) %*% solve(S) %*% d_vec),
+    error = function(e) NA_real_
+  )
+  if (is.na(smd_sq)) {
+    # Fallback: max per-level SMD
+    per_level <- mapply(function(pt, pc) {
+      s <- sqrt((pt * (1 - pt) + pc * (1 - pc)) / 2)
+      if (is.na(s) || s == 0) NA_real_ else abs(pt - pc) / s
+    }, pT, pC)
+    return(suppressWarnings(max(per_level, na.rm = TRUE)))
+  }
+  sqrt(max(0, smd_sq))
+}
+
+make_value <- function(d, spec) {
+  total <- nrow(d)
+  switch(spec$kind,
+    n           = cnt(total),
+    cont        = ms(d[[spec$var]]),
+    bin         = np(sum(d[[spec$var]] == spec$level, na.rm = TRUE), total),
+    cat_section = "",
+    cat_level   = np(sum(d[[spec$var]] == spec$level, na.rm = TRUE), total)
+  )
+}
+
+make_smd <- function(d_period, spec) {
+  switch(spec$kind,
+    n           = NA_real_,
+    cont        = smd_cont(d_period, spec$var),
+    bin         = smd_bin(d_period, spec$var, spec$level),
+    cat_section = smd_cat(d_period, spec$var),
+    cat_level   = NA_real_
+  )
+}
+
+# Apply common matched-cohort coercions: BMI clip, factor coercions, derive
+# race_eth and region_label. Per-organ extras (status_label, dgn_group join,
+# organ-specific continuous fields) are applied separately in each organ chunk.
+coerce_matched_common <- function(d) {
+  d %>% mutate(
+    bmi          = ifelse(bmi >= 10 & bmi <= 80, bmi, NA_real_),
+    cohort       = factor(cohort, levels = c("Pre-Policy", "Post-Policy")),
+    transplanted = factor(transplanted, levels = c(0, 1),
+                          labels = c("Waitlist", "Recipient")),
+    blood_type   = factor(blood_type, levels = c("A", "B", "AB", "O")),
+    insurance    = factor(insurance,
+                          levels = c("Private", "Medicare", "Medicaid", "Other")),
+    functional_status = factor(functional_status,
+                               levels = c("Limited Impairment, 10-30%",
+                                          "Moderate Impairment, 40-60%",
+                                          "Severe Impairment, 70-100%",
+                                          "Unknown")),
+    on_dialysis  = factor(on_dialysis, levels = c(0, 1), labels = c("No", "Yes")),
+    race_eth = factor(case_when(
+      race_hispanic == 1 ~ "Hispanic",
+      race_white    == 1 ~ "White",
+      race_black    == 1 ~ "Black",
+      TRUE               ~ "Other"
+    ), levels = c("White", "Black", "Hispanic", "Other")),
+    region_label = factor(paste0("Region ", region),
+                          levels = paste0("Region ", 1:11))
+  )
+}
+
+matched_common_specs <- c(
+  list(
+    list(row_type = "data",    label = "N",                                           kind = "n"),
+    list(row_type = "data",    label = "Age at listing, mean (SD), years",            kind = "cont", var = "age"),
+    list(row_type = "data",    label = "Female sex, No. (%)",                         kind = "bin",  var = "female", level = 1),
+    list(row_type = "section", label = "Race/ethnicity, No. (%)",                     kind = "cat_section", var = "race_eth"),
+    list(row_type = "data",    label = "  White",                                     kind = "cat_level",   var = "race_eth", level = "White"),
+    list(row_type = "data",    label = "  Black",                                     kind = "cat_level",   var = "race_eth", level = "Black"),
+    list(row_type = "data",    label = "  Hispanic",                                  kind = "cat_level",   var = "race_eth", level = "Hispanic"),
+    list(row_type = "data",    label = "  Other",                                     kind = "cat_level",   var = "race_eth", level = "Other"),
+    list(row_type = "section", label = "Primary payer, No. (%)",                      kind = "cat_section", var = "insurance"),
+    list(row_type = "data",    label = "Private insurance",                           kind = "cat_level",   var = "insurance", level = "Private"),
+    list(row_type = "data",    label = "Medicare",                                    kind = "cat_level",   var = "insurance", level = "Medicare"),
+    list(row_type = "data",    label = "Medicaid",                                    kind = "cat_level",   var = "insurance", level = "Medicaid"),
+    list(row_type = "data",    label = "Other",                                       kind = "cat_level",   var = "insurance", level = "Other"),
+    list(row_type = "data",    label = "Body mass index, mean (SD), kg/m²",      kind = "cont", var = "bmi"),
+    list(row_type = "section", label = "Functional status (Karnofsky), No. (%)",     kind = "cat_section", var = "functional_status"),
+    list(row_type = "data",    label = "  Limited impairment (10%–30%)",         kind = "cat_level",   var = "functional_status", level = "Limited Impairment, 10-30%"),
+    list(row_type = "data",    label = "  Moderate impairment (40%–60%)",        kind = "cat_level",   var = "functional_status", level = "Moderate Impairment, 40-60%"),
+    list(row_type = "data",    label = "  Severe impairment (70%–100%)",         kind = "cat_level",   var = "functional_status", level = "Severe Impairment, 70-100%"),
+    list(row_type = "data",    label = "  Unknown",                                   kind = "cat_level",   var = "functional_status", level = "Unknown"),
+    list(row_type = "section", label = "Blood type (ABO), No. (%)",                   kind = "cat_section", var = "blood_type")
+  ),
+  lapply(c("A", "B", "AB", "O"),
+         function(lv) list(row_type = "data", label = lv,
+                           kind = "cat_level", var = "blood_type", level = lv)),
+  list(list(row_type = "section", label = "Region of listing, No. (%)",
+            kind = "cat_section", var = "region_label")),
+  lapply(1:11, function(i) list(row_type = "data", label = paste0("Region ", i),
+                                kind = "cat_level", var = "region_label",
+                                level = paste0("Region ", i))),
+  list(list(row_type = "data", label = "Dialysis at listing, No. (%)",
+            kind = "bin", var = "on_dialysis", level = "Yes"))
+)
+
+# Build the 8-column Table 1C dataframe for a given matched dataset and spec list.
+build_matched_table_df <- function(d, specs) {
+  d_pre  <- d %>% filter(cohort == "Pre-Policy")
+  d_post <- d %>% filter(cohort == "Post-Policy")
+  pre_w  <- d_pre  %>% filter(transplanted == "Waitlist")
+  pre_r  <- d_pre  %>% filter(transplanted == "Recipient")
+  post_w <- d_post %>% filter(transplanted == "Waitlist")
+  post_r <- d_post %>% filter(transplanted == "Recipient")
+  tibble(
+    row_type      = vapply(specs, function(s) s$row_type, character(1)),
+    row_label     = vapply(specs, function(s) s$label,    character(1)),
+    pre_waitlist  = vapply(specs, function(s) make_value(pre_w,  s), character(1)),
+    pre_recipient = vapply(specs, function(s) make_value(pre_r,  s), character(1)),
+    pre_smd       = vapply(specs, function(s) fmt_smd(make_smd(d_pre,  s)), character(1)),
+    post_waitlist = vapply(specs, function(s) make_value(post_w, s), character(1)),
+    post_recipient= vapply(specs, function(s) make_value(post_r, s), character(1)),
+    post_smd      = vapply(specs, function(s) fmt_smd(make_smd(d_post, s)), character(1))
+  )
+}
+
+render_matched_table <- function(df, organ_label, matching_note) {
+  caption_text <- paste(organ_label, "matched-cohort candidate characteristics",
+                        "by transplant status within each policy period.",
+                        "Pre-Policy: Aug 2019–Jul 2021;",
+                        "Post-Policy: Aug 2022–Jul 2024.")
+  kable(
+    df %>% select(-row_type),
+    format    = "latex",
+    booktabs  = TRUE,
+    col.names = c(" ",
+                  "Pre Waitlist", "Pre Recipient", "Pre SMD",
+                  "Post Waitlist", "Post Recipient", "Post SMD"),
+    caption   = caption_text,
+    linesep   = ""
+  ) %>%
+    kable_styling(latex_options = c("striped", "hold_position"), font_size = 7) %>%
+    landscape() %>%
+    add_footnote(
+      c("Continuous variables: mean (SD); SMD = (mean recipient - mean waitlist) / pooled SD (signed).",
+        "Categorical variables: No. (%); SMD computed as Yang-Dalton multivariate standardized mean difference on the section header row (or signed proportion-difference SMD for binary single-row indicators); |SMD| < 0.1 typically indicates good balance.",
+        matching_note,
+        "Diagnosis sub-categories use the SRTR Diagnosis Group mappings."),
+      notation = "none", threeparttable = TRUE
+    )
+}
+```
+
+```{r heart_matched_waitlist_vs_recipient}
+mhe <- readRDS("matched_heart.rds") %>%
+  coerce_matched_common() %>%
+  mutate(status_label = factor(case_when(
+    init_status == "2110" ~ "Status 1",
+    init_status == "2120" ~ "Status 2",
+    init_status == "2130" ~ "Status 3",
+    init_status == "2140" ~ "Status 4",
+    init_status == "2150" ~ "Status 5",
+    init_status == "2160" ~ "Status 6",
+    init_status %in% c("2999", "2010", "2020") ~ "Status 7",
+    TRUE ~ NA_character_
+  ), levels = paste("Status", 1:7))) %>%
+  mutate(dgn_join_key = as.character(dgn_code)) %>%
+  left_join(dgn_maps$Heart %>% rename(dgn_group = group),
+            by = c("dgn_join_key" = "dgn_code")) %>%
+  mutate(dgn_group = factor(dgn_group, levels = unique(dgn_maps$Heart$group)))
+
+heart_dgn_levels <- order_diag_groups(unique(dgn_maps$Heart$group),
+                                       mhe %>% rename(group = dgn_group))
+heart_dgn_labels <- strip_organ_prefix(heart_dgn_levels)
+
+heart_specs <- c(
+  matched_common_specs,
+  list(list(row_type = "section", label = "Status at listing, No. (%)",
+            kind = "cat_section", var = "status_label")),
+  lapply(1:7, function(i) list(row_type = "data", label = paste0("Status ", i),
+                               kind = "cat_level", var = "status_label",
+                               level = paste0("Status ", i))),
+  list(list(row_type = "section", label = "Diagnosis, No. (%)",
+            kind = "cat_section", var = "dgn_group")),
+  lapply(seq_along(heart_dgn_levels), function(i)
+         list(row_type = "data", label = paste0("  ", heart_dgn_labels[i]),
+              kind = "cat_level", var = "dgn_group", level = heart_dgn_levels[i])),
+  list(
+    list(row_type = "data", label = "Ventricular assist device at listing, No. (%)", kind = "bin", var = "vad",  level = 1),
+    list(row_type = "data", label = "ECMO at listing, No. (%)",                      kind = "bin", var = "ecmo", level = 1),
+    list(row_type = "data", label = "Intra-aortic balloon pump at listing, No. (%)", kind = "bin", var = "iabp", level = 1)
+  )
+)
+
+table1c_heart_df <- build_matched_table_df(mhe, heart_specs)
+write.csv(table1c_heart_df, "heart_matched_waitlist_vs_recipient.csv",
+          row.names = FALSE)
+
+render_matched_table(
+  table1c_heart_df, "Heart",
+  paste("Matched 1:1 within each policy period via propensity-score",
+        "nearest-neighbor matching on blood_type, age, region, list_day,",
+        "init_status, on_dialysis, simple_diag, vad, ecmo, iabp.")
+)
+```
+
+```{r liver_matched_waitlist_vs_recipient}
+mli <- readRDS("matched_liver.rds") %>%
+  coerce_matched_common() %>%
+  mutate(
+    status_label = factor(case_when(
+      init_status == "6011" ~ "Status 1A",
+      init_status == "6012" ~ "Status 1B",
+      init_status %in% as.character(6206:6240) ~ "Status 2",
+      TRUE ~ NA_character_
+    ), levels = c("Status 1A", "Status 1B", "Status 2")),
+    dgn_join_key = as.character(diag)
+  ) %>%
+  left_join(dgn_maps$Liver %>% rename(dgn_group = group),
+            by = c("dgn_join_key" = "dgn_code")) %>%
+  mutate(dgn_group = factor(dgn_group, levels = unique(dgn_maps$Liver$group)))
+
+liver_dgn_levels <- order_diag_groups(unique(dgn_maps$Liver$group),
+                                       mli %>% rename(group = dgn_group))
+liver_dgn_labels <- strip_organ_prefix(liver_dgn_levels)
+
+liver_specs <- c(
+  matched_common_specs,
+  list(
+    list(row_type = "section", label = "Status at listing, No. (%)",       kind = "cat_section", var = "status_label"),
+    list(row_type = "data",    label = "Status 1A",                        kind = "cat_level",   var = "status_label", level = "Status 1A"),
+    list(row_type = "data",    label = "Status 1B",                        kind = "cat_level",   var = "status_label", level = "Status 1B"),
+    list(row_type = "data",    label = "Status 2",                         kind = "cat_level",   var = "status_label", level = "Status 2"),
+    list(row_type = "data",    label = "MELD score at listing, mean (SD)", kind = "cont",        var = "meld_init"),
+    list(row_type = "data",    label = "Hemodialysis at listing, No. (%)", kind = "bin",         var = "on_dialysis", level = "Yes"),
+    list(row_type = "section", label = "Diagnosis, No. (%)",               kind = "cat_section", var = "dgn_group")
+  ),
+  lapply(seq_along(liver_dgn_levels), function(i)
+         list(row_type = "data", label = paste0("  ", liver_dgn_labels[i]),
+              kind = "cat_level", var = "dgn_group", level = liver_dgn_levels[i]))
+)
+
+table1c_liver_df <- build_matched_table_df(mli, liver_specs)
+write.csv(table1c_liver_df, "liver_matched_waitlist_vs_recipient.csv",
+          row.names = FALSE)
+
+render_matched_table(
+  table1c_liver_df, "Liver",
+  paste("Matched 1:1 within each policy period via propensity-score",
+        "nearest-neighbor matching as defined in",
+        "survival_benefit_liver_2022.Rmd.")
+)
+```
+
+```{r lung_matched_waitlist_vs_recipient}
+# Note: the template requested FEV1 and supplemental-O2 rows, but the SAF Q2
+# 2025 cand_thor (and stathist_thor) do not populate CAN_FEV1 or
+# CAN_AT_REST_O2 for lung candidates listed after 2015 — those fields were
+# moved to a LAS/CAS-history file that is not in this SAF release. Those two
+# rows are therefore omitted.
+
+mlu <- readRDS("matched_lung.rds") %>%
+  coerce_matched_common() %>%
+  mutate(dgn_join_key = as.character(dgn_code)) %>%
+  left_join(dgn_maps$Lung %>% rename(dgn_group = group),
+            by = c("dgn_join_key" = "dgn_code")) %>%
+  mutate(dgn_group = factor(dgn_group, levels = unique(dgn_maps$Lung$group)))
+
+lung_dgn_pool <- unique(dgn_maps$Lung$group)
+lung_dgn_pool <- lung_dgn_pool[!grepl("Congenital", lung_dgn_pool)]
+lung_dgn_levels <- order_diag_groups(lung_dgn_pool,
+                                      mlu %>% rename(group = dgn_group))
+lung_dgn_labels <- strip_organ_prefix(lung_dgn_levels)
+
+lung_specs <- c(
+  matched_common_specs,
+  list(list(row_type = "section", label = "Diagnosis, No. (%)",
+            kind = "cat_section", var = "dgn_group")),
+  lapply(seq_along(lung_dgn_levels), function(i)
+         list(row_type = "data", label = paste0("  ", lung_dgn_labels[i]),
+              kind = "cat_level", var = "dgn_group", level = lung_dgn_levels[i]))
+)
+
+table1c_lung_df <- build_matched_table_df(mlu, lung_specs)
+write.csv(table1c_lung_df, "lung_matched_waitlist_vs_recipient.csv",
+          row.names = FALSE)
+
+render_matched_table(
+  table1c_lung_df, "Lung",
+  paste("Matched 1:1 within each policy period via propensity-score",
+        "nearest-neighbor matching as defined in",
+        "survival_benefit_lung_2022.Rmd. FEV1 and supplemental O2 are",
+        "omitted because CAN_FEV1 and CAN_AT_REST_O2 are not populated",
+        "in cand_thor for post-2015 lung candidates in this SAF release.")
+)
+```
+
+```{r kidney_matched_waitlist_vs_recipient}
+mki <- readRDS("matched_kidney.rds") %>%
+  coerce_matched_common() %>%
+  mutate(
+    dgn_join_key      = as.character(diag),
+    years_on_dialysis = ifelse(on_dialysis == "Yes" & dialysis_days > 0,
+                               dialysis_days / 365.25, NA_real_)
+  ) %>%
+  left_join(dgn_maps$Kidney %>% rename(dgn_group = group),
+            by = c("dgn_join_key" = "dgn_code")) %>%
+  mutate(dgn_group = factor(dgn_group, levels = unique(dgn_maps$Kidney$group)))
+
+kidney_dgn_levels <- order_diag_groups(unique(dgn_maps$Kidney$group),
+                                        mki %>% rename(group = dgn_group))
+kidney_dgn_labels <- strip_organ_prefix(kidney_dgn_levels)
+
+kidney_specs <- c(
+  matched_common_specs,
+  list(
+    list(row_type = "data",    label = "Years on dialysis at listing, mean (SD)",
+         kind = "cont", var = "years_on_dialysis"),
+    list(row_type = "section", label = "Diagnosis, No. (%)",
+         kind = "cat_section", var = "dgn_group")
+  ),
+  lapply(seq_along(kidney_dgn_levels), function(i)
+         list(row_type = "data", label = paste0("  ", kidney_dgn_labels[i]),
+              kind = "cat_level", var = "dgn_group", level = kidney_dgn_levels[i]))
+)
+
+table1c_kidney_df <- build_matched_table_df(mki, kidney_specs)
+write.csv(table1c_kidney_df, "kidney_matched_waitlist_vs_recipient.csv",
+          row.names = FALSE)
+
+render_matched_table(
+  table1c_kidney_df, "Kidney",
+  paste("Matched 1:1 within each policy period via propensity-score",
+        "nearest-neighbor matching as defined in",
+        "survival_benefit_kidney_2022.Rmd. 'Years on dialysis at listing'",
+        "is restricted to candidates currently on dialysis with",
+        "dialysis_days > 0.")
+)
+```

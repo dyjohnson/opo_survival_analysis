@@ -1,0 +1,1598 @@
+---
+title: "Kidney Transplant Survival Benefit: Pre- vs. Post-2022 Policy Implementation"
+author: "Daniel Y. Johnson"
+date: "2026-04-16"
+output: html_document
+knit: (function(input, ...) rmarkdown::render(input, output_dir = file.path(dirname(input), "kidney"), ...))
+---
+
+```{r global_options, include=FALSE}
+library(knitr)
+opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE,
+               tidy.opts = list(width.cutoff = 60))
+```
+
+```{r packages, warning=FALSE, message=FALSE, cache=FALSE}
+library(haven)
+library(tidyverse)
+library(survival)
+library(MatchIt)
+library(survRM2)
+```
+
+```{r functions}
+comma   <- function(x) format(x, digits = 3, big.mark = ",")
+comma_1 <- function(x) format(x, digits = 1, big.mark = ",")
+comma_2 <- function(x) format(x, digits = 2, big.mark = ",")
+
+# Convert survfit object to a tidy data frame for ggplot2 step-function plotting.
+# Prepends time=0 (surv=1) for each stratum and clips at tau days.
+km_to_df <- function(fit, tau = 365,
+                     group_labels = c("transplanted=0" = "Waitlisted",
+                                      "transplanted=1" = "Transplant recipient")) {
+  sf  <- summary(fit, extend = TRUE)
+  df  <- data.frame(
+    time   = sf$time,
+    surv   = sf$surv,
+    lower  = sf$lower,
+    upper  = sf$upper,
+    strata = as.character(sf$strata)
+  ) %>%
+    filter(time <= tau)
+
+  t0 <- data.frame(
+    time   = 0, surv = 1, lower = 1, upper = 1,
+    strata = unique(df$strata)
+  )
+
+  bind_rows(t0, df) %>%
+    arrange(strata, time) %>%
+    mutate(group = factor(recode(strata, !!!group_labels),
+                          levels = unname(group_labels)))
+}
+
+# KM step-function plot with dashed 95% CI lines.
+# Data frame must come from km_to_df().
+plot_km <- function(kdf, title = "", tau = 365,
+                    colors = c("Transplant recipient" = "#2166ac",
+                               "Waitlisted"           = "#d6604d")) {
+  ggplot(kdf, aes(x = time / 30.44, y = surv, color = group)) +
+    geom_step(linewidth = 0.9) +
+    geom_step(aes(y = lower), linetype = "dashed", linewidth = 0.35) +
+    geom_step(aes(y = upper), linetype = "dashed", linewidth = 0.35) +
+    scale_x_continuous(limits = c(0, tau / 30.44), breaks = 0:12,
+                       expand = expansion(mult = c(0, 0.02))) +
+    scale_y_continuous(limits = c(0, 1),
+                       labels = scales::percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0.02))) +
+    scale_color_manual(values = colors) +
+    labs(x = "Time, mo", y = "Survival probability",
+         title = title, color = NULL) +
+    theme_bw(base_size = 12) +
+    theme(legend.position  = "bottom",
+          panel.grid.minor = element_blank())
+}
+
+# Extract per-arm RMSTs and the RMST difference (survival benefit) from rmst2().
+rmst_row <- function(r2, label) {
+  diff_row <- r2$unadjusted.result["RMST (arm=1)-(arm=0)", ]
+  data.frame(
+    cohort   = label,
+    rmst_tx  = round(r2$RMST.arm1$rmst["Est."], 1),
+    rmst_wl  = round(r2$RMST.arm0$rmst["Est."], 1),
+    benefit  = round(diff_row["Est."],       1),
+    lo_95    = round(diff_row["lower .95"],  1),
+    hi_95    = round(diff_row["upper .95"],  1),
+    p_value  = signif(diff_row["p"],         3)
+  )
+}
+
+# Back-calculate SE of RMST difference from symmetric 95% CI.
+se_rmst_diff <- function(r2) {
+  drow <- r2$unadjusted.result["RMST (arm=1)-(arm=0)", ]
+  (drow["upper .95"] - drow["lower .95"]) / (2 * 1.96)
+}
+
+# Back-calculate SE of a single RMST arm estimate from its symmetric 95% CI.
+se_arm <- function(rmst_vec) {
+  (rmst_vec["upper .95"] - rmst_vec["lower .95"]) / (2 * 1.96)
+}
+
+# Cohort label helper.
+cohort_name <- function(coh) ifelse(coh == 1L, "Pre-Policy", "Post-Policy")
+
+# Log-rank p-value comparing two pre-vs-post cohorts on KM survival.
+logrank_p_prepost <- function(d_pre, d_post,
+                              time_col = "follow_days_1y",
+                              event_col = "dead_1y",
+                              tau = NULL) {
+  prep <- function(d, label) {
+    t <- d[[time_col]]; e <- d[[event_col]]
+    if (!is.null(tau)) { e <- ifelse(t > tau, 0L, e); t <- pmin(t, tau) }
+    data.frame(.lr_t = t, .lr_e = e, .lr_group = label)
+  }
+  combined <- rbind(prep(d_pre, "Pre"), prep(d_post, "Post"))
+  sd <- survdiff(Surv(.lr_t, .lr_e) ~ .lr_group, data = combined)
+  pchisq(sd$chisq, df = length(sd$n) - 1, lower.tail = FALSE)
+}
+
+# Print a clean survival benefit summary from an rmst2() object.
+print_benefit <- function(r2) {
+  a1  <- r2$RMST.arm1$rmst
+  a0  <- r2$RMST.arm0$rmst
+  dif <- r2$unadjusted.result["RMST (arm=1)-(arm=0)", ]
+  cat(sprintf("  Transplant recipients:  %5.1f days (95%% CI %5.1f\u2013%5.1f)\n",
+              a1["Est."], a1["lower .95"], a1["upper .95"]))
+  cat(sprintf("  Waitlisted controls:    %5.1f days (95%% CI %5.1f\u2013%5.1f)\n",
+              a0["Est."], a0["lower .95"], a0["upper .95"]))
+  cat(sprintf("  Avg benefit per tx:     %+5.1f days (95%% CI %+.1f to %+.1f, p = %s)\n",
+              dif["Est."], dif["lower .95"], dif["upper .95"],
+              formatC(dif["p"], format = "e", digits = 2)))
+}
+```
+
+This analysis compares the 1-year survival benefit of kidney transplantation across
+two cohorts defined relative to the Aug 1, 2022 policy implementation:
+
+- **Pre-Policy (pre-announcement):** Candidates waitlisted Aug 1, 2019–Jul 31, 2021
+- **Post-Policy (post-announcement):** Candidates waitlisted Aug 1, 2022–Jul 31, 2024
+
+Within each cohort, kidney transplant recipients are matched 1:1 to waitlisted
+controls using propensity scores estimated via probit regression and Mahalanobis
+distance nearest-neighbor matching on listing-date covariates. Survival is measured
+from the listing date for all candidates. Multi-organ recipients (simultaneous
+kidney-pancreas and other multi-organ) are excluded.
+
+Cohort assembly (loading SRTR SAF files, exclusions, matching) is centralized in `data_prep.Rmd`. This file loads `cohort_<organ>.rds` and `matched_<organ>.rds` and runs only the matched-cohort analyses.
+`hist_opo_txc.sas7bdat`
+
+```{r cohort_dates}
+c1_start <- as.Date("2019-08-01")
+c1_end   <- as.Date("2021-07-31")
+c2_start <- as.Date("2022-08-01")
+c2_end   <- as.Date("2024-07-31")
+```
+
+```{r load_cohorts, cache=FALSE}
+# Cohorts and 1:1 propensity-matched pairs are assembled centrally in
+# data_prep.Rmd, which writes cohort_kidney.rds + matched_kidney.rds.
+# This analysis file loads those RDSes and runs the matched-cohort analyses.
+cohort_combined  <- readRDS("cohort_kidney.rds")
+matched_combined <- readRDS("matched_kidney.rds")
+
+required_cols <- c("PX_ID", "list_date", "transplanted", "cohort",
+                   "tx_date", "dead_1y", "follow_days_1y", "blood_type",
+                   "age", "region", "list_day", "on_dialysis",
+                   "dialysis_days", "diag", "ctr_cd")
+stopifnot(all(required_cols %in% names(cohort_combined)))
+stopifnot(all(required_cols %in% names(matched_combined)))
+stopifnot(all(c("Pre-Policy", "Post-Policy") %in% cohort_combined$cohort))
+
+cohort1  <- cohort_combined  %>% filter(cohort == "Pre-Policy")
+cohort2  <- cohort_combined  %>% filter(cohort == "Post-Policy")
+matched1 <- matched_combined %>% filter(cohort == "Pre-Policy")
+matched2 <- matched_combined %>% filter(cohort == "Post-Policy")
+
+cat(sprintf("Loaded kidney cohorts from cohort_kidney.rds + matched_kidney.rds:
+"))
+cat(sprintf("  Pre-Policy  eligible: %s candidates (%s recipients, %s waitlisted)
+",
+            comma(nrow(cohort1)), comma(sum(cohort1$transplanted)),
+            comma(sum(cohort1$transplanted == 0))))
+cat(sprintf("  Pre-Policy  matched:  %s pairs
+", comma(nrow(matched1) / 2)))
+cat(sprintf("  Post-Policy eligible: %s candidates (%s recipients, %s waitlisted)
+",
+            comma(nrow(cohort2)), comma(sum(cohort2$transplanted)),
+            comma(sum(cohort2$transplanted == 0))))
+cat(sprintf("  Post-Policy matched:  %s pairs
+", comma(nrow(matched2) / 2)))
+```
+
+
+
+
+
+
+
+# Pre-Policy: Pre-Announcement (Aug 1, 2019–Jul 31, 2021)
+
+
+
+
+## Kaplan-Meier Curves — Pre-Policy
+
+```{r cohort1_km, fig.width=7, fig.height=5}
+fit1 <- survfit(Surv(follow_days_1y, dead_1y) ~ transplanted,
+                data    = matched1,
+                cluster = subclass)
+
+kdf1 <- km_to_df(fit1)
+
+plot_km(kdf1,
+        title = "Pre-Policy: 1-Year Survival from Listing Date\nAug 1, 2019\u2013Jul 31, 2021")
+```
+
+## 1-Year RMST — Pre-Policy
+
+```{r cohort1_rmst}
+rmst1 <- rmst2(
+  time   = matched1$follow_days_1y,
+  status = matched1$dead_1y,
+  arm    = matched1$transplanted,
+  tau    = 365
+)
+
+cat("1-year RMST from listing date (tau = 365 days):\n")
+print_benefit(rmst1)
+```
+
+
+# Post-Policy: Post-Announcement (Aug 1, 2022–Jul 31, 2024)
+
+
+
+
+
+
+## Kaplan-Meier Curves — Post-Policy
+
+```{r cohort2_km, fig.width=7, fig.height=5}
+fit2 <- survfit(Surv(follow_days_1y, dead_1y) ~ transplanted,
+                data    = matched2,
+                cluster = subclass)
+
+kdf2 <- km_to_df(fit2)
+
+plot_km(kdf2,
+        title = "Post-Policy: 1-Year Survival from Listing Date\nAug 1, 2022\u2013Jul 31, 2024")
+```
+
+## 1-Year RMST — Post-Policy
+
+```{r cohort2_rmst}
+rmst2_out <- rmst2(
+  time   = matched2$follow_days_1y,
+  status = matched2$dead_1y,
+  arm    = matched2$transplanted,
+  tau    = 365
+)
+
+cat("1-year RMST from listing date (tau = 365 days):\n")
+print_benefit(rmst2_out)
+```
+
+
+# Cross-Cohort Comparison
+
+```{r aggregate_benefit}
+# Transposed aggregate-benefit table: rows = metrics, columns = Pre, Post,
+# p (Pre vs Post). Transplant counts come from the full pre-matching cohorts;
+# matching was restricted by the smaller waitlisted group, so the matched N
+# understates actual volume. p-values: chi-square on N transplants, Student's t-test
+# on per-arm RMSTs and on the avg/aggregate benefit.
+
+n1 <- sum(cohort1$transplanted)
+n2 <- sum(cohort2$transplanted)
+
+agg <- bind_rows(
+  rmst_row(rmst1,     "Pre-Policy"),
+  rmst_row(rmst2_out, "Post-Policy")
+) %>%
+  mutate(
+    n_tx      = c(n1, n2),
+    agg_days  = n_tx * benefit,
+    agg_lo    = n_tx * lo_95,
+    agg_hi    = n_tx * hi_95,
+    agg_ly    = agg_days / 365.25,
+    agg_ly_lo = agg_lo   / 365.25,
+    agg_ly_hi = agg_hi   / 365.25
+  )
+
+# Per-arm RMSTs (waitlisted = arm 0, recipients = arm 1)
+arm_rmst <- function(rmst_obj, arm) {
+  r <- rmst_obj[[paste0("RMST.arm", arm)]][["rmst"]]
+  list(est = unname(r["Est."]),
+       lo  = unname(r["lower .95"]),
+       hi  = unname(r["upper .95"]),
+       se  = unname((r["upper .95"] - r["lower .95"]) / (2 * 1.96)))
+}
+wl1 <- arm_rmst(rmst1,     0); wl2 <- arm_rmst(rmst2_out, 0)
+rc1 <- arm_rmst(rmst1,     1); rc2 <- arm_rmst(rmst2_out, 1)
+
+se_d1 <- se_rmst_diff(rmst1)
+se_d2 <- se_rmst_diff(rmst2_out)
+
+# Student's t-test on Pre vs Post comparison.
+# df = total matched cohort size (Pre + Post) - 2.
+df_t    <- nrow(matched1) + nrow(matched2) - 2
+ttest_p <- function(pre, post, se_pre, se_post) {
+  t_stat <- (post - pre) / sqrt(se_pre^2 + se_post^2)
+  2 * pt(-abs(t_stat), df = df_t)
+}
+
+p_wl  <- ttest_p(wl1$est,         wl2$est,         wl1$se,        wl2$se)
+p_rc  <- ttest_p(rc1$est,         rc2$est,         rc1$se,        rc2$se)
+p_avg <- ttest_p(agg$benefit[1],  agg$benefit[2],  se_d1,         se_d2)
+p_agg <- ttest_p(agg$agg_days[1], agg$agg_days[2], n1 * se_d1,    n2 * se_d2)
+
+ct    <- matrix(c(n1, nrow(cohort1) - n1, n2, nrow(cohort2) - n2), nrow = 2)
+p_ntx <- chisq.test(ct, correct = FALSE)$p.value
+
+fmt_pv  <- function(p) ifelse(is.na(p), "", ifelse(p < 0.001, "<0.001", ifelse(p < 0.01, sprintf("%.3f", p), sprintf("%.2f", p))))
+ci_d    <- function(est, lo, hi) sprintf("%.1f (%.1f, %.1f)", est, lo, hi)
+ci_dpos <- function(est, lo, hi) sprintf("%+.1f (%+.1f, %+.1f)", est, lo, hi)
+ci_int  <- function(est, lo, hi) {
+  fmt <- function(x) format(round(x, 1), big.mark = ",", nsmall = 1, trim = TRUE)
+  sprintf("%s (%s, %s)", fmt(est), fmt(lo), fmt(hi))
+}
+ci_ly   <- function(est, lo, hi) sprintf("%.1f (%.1f, %.1f)", est, lo, hi)
+
+# Cohort and matched-cohort counts
+n_elig1   <- nrow(cohort1);              n_elig2   <- nrow(cohort2)
+n_wl1     <- n_elig1 - n1;               n_wl2     <- n_elig2 - n2
+n_match1  <- nrow(matched1);             n_match2  <- nrow(matched2)
+n_match_r1 <- sum(matched1$transplanted); n_match_r2 <- sum(matched2$transplanted)
+n_match_w1 <- n_match1 - n_match_r1;     n_match_w2 <- n_match2 - n_match_r2
+n_tx_tot1 <- n1
+n_tx_tot2 <- n2
+
+chisq_count <- function(n_pre, n_post) {
+  if (n_pre + n_post == 0) return(NA_real_)
+  suppressWarnings(chisq.test(c(n_pre, n_post), p = c(0.5, 0.5)))$p.value
+}
+p_n_elig    <- chisq_count(n_elig1,    n_elig2)
+p_n_eligwl  <- chisq_count(n_wl1,      n_wl2)
+p_n_match   <- chisq_count(n_match1,   n_match2)
+p_n_matchr  <- chisq_count(n_match_r1, n_match_r2)
+p_n_matchw  <- chisq_count(n_match_w1, n_match_w2)
+p_n_tx_tot  <- chisq_count(n_tx_tot1,  n_tx_tot2)
+
+# Pre vs Post differences with 95% CIs.
+ci_int_signed <- function(est, lo, hi) {
+  fmt <- function(x) {
+    s <- if (isTRUE(x >= 0)) "+" else ""
+    paste0(s, format(round(x, 1), big.mark = ",", nsmall = 1, trim = TRUE))
+  }
+  sprintf("%s (%s, %s)", fmt(est), fmt(lo), fmt(hi))
+}
+ci_ly_signed <- function(est, lo, hi) {
+  sprintf("%+.1f (%+.1f, %+.1f)", est, lo, hi)
+}
+diff_count <- function(pre, post) {
+  d <- post - pre
+  sprintf("%s%s", if (d >= 0) "+" else "", comma(d))
+}
+diff_se <- function(pre, post, se_pre, se_post, fmt) {
+  d  <- post - pre
+  se <- sqrt(se_pre^2 + se_post^2)
+  fmt(d, d - 1.96 * se, d + 1.96 * se)
+}
+
+# 1-year (365-day) survival probability per arm from the matched-cohort KM
+# fits.
+fit1_surv <- survfit(Surv(follow_days_1y, dead_1y) ~ transplanted,
+                     data = matched1, cluster = subclass)
+fit2_surv <- survfit(Surv(follow_days_1y, dead_1y) ~ transplanted,
+                     data = matched2, cluster = subclass)
+get_surv_at_365 <- function(fit) {
+  s    <- summary(fit, times = 365, extend = TRUE)
+  idx0 <- grepl("transplanted=0", as.character(s$strata))
+  idx1 <- grepl("transplanted=1", as.character(s$strata))
+  list(
+    wl = list(est = s$surv[idx0], lo = s$lower[idx0], hi = s$upper[idx0],
+              se  = (s$upper[idx0] - s$lower[idx0]) / (2 * 1.96)),
+    rc = list(est = s$surv[idx1], lo = s$lower[idx1], hi = s$upper[idx1],
+              se  = (s$upper[idx1] - s$lower[idx1]) / (2 * 1.96))
+  )
+}
+surv1 <- get_surv_at_365(fit1_surv)
+surv2 <- get_surv_at_365(fit2_surv)
+p_surv_wl <- logrank_p_prepost(matched1 %>% filter(transplanted == 0),
+                               matched2 %>% filter(transplanted == 0))
+p_surv_rc <- logrank_p_prepost(matched1 %>% filter(transplanted == 1),
+                               matched2 %>% filter(transplanted == 1))
+
+ci_pct      <- function(est, lo, hi)
+  sprintf("%.1f%% (%.1f%%, %.1f%%)", 100 * est, 100 * lo, 100 * hi)
+ci_pct_diff <- function(est, lo, hi)
+  sprintf("%+.1f%% (%+.1f%%, %+.1f%%)", 100 * est, 100 * lo, 100 * hi)
+
+agg_table <- tibble(
+  ` ` = c("N eligible candidates",
+          "N eligible recipients",
+          "N eligible waitlisted",
+          "N matched candidates",
+          "N matched recipients",
+          "N matched waitlisted",
+          "N transplants",
+          "RMST waitlisted (days)",
+          "1-year survival, waitlisted (%)",
+          "RMST recipients (days)",
+          "1-year survival, recipients (%)",
+          "Avg benefit per tx (days)",
+          "Aggregate benefit (days)",
+          "Aggregate benefit (life-years)"),
+  `Pre-Policy` = c(comma(n_elig1),
+                   comma(n1),
+                   comma(n_wl1),
+                   comma(n_match1),
+                   comma(n_match_r1),
+                   comma(n_match_w1),
+                   comma(n_tx_tot1),
+                   ci_d(wl1$est, wl1$lo, wl1$hi),
+                   ci_pct(surv1$wl$est, surv1$wl$lo, surv1$wl$hi),
+                   ci_d(rc1$est, rc1$lo, rc1$hi),
+                   ci_pct(surv1$rc$est, surv1$rc$lo, surv1$rc$hi),
+                   ci_dpos(agg$benefit[1],  agg$lo_95[1],     agg$hi_95[1]),
+                   ci_int(agg$agg_days[1], agg$agg_lo[1],    agg$agg_hi[1]),
+                   ci_ly(agg$agg_ly[1],    agg$agg_ly_lo[1], agg$agg_ly_hi[1])),
+  `Post-Policy` = c(comma(n_elig2),
+                    comma(n2),
+                    comma(n_wl2),
+                    comma(n_match2),
+                    comma(n_match_r2),
+                    comma(n_match_w2),
+                    comma(n_tx_tot2),
+                    ci_d(wl2$est, wl2$lo, wl2$hi),
+                    ci_pct(surv2$wl$est, surv2$wl$lo, surv2$wl$hi),
+                    ci_d(rc2$est, rc2$lo, rc2$hi),
+                    ci_pct(surv2$rc$est, surv2$rc$lo, surv2$rc$hi),
+                    ci_dpos(agg$benefit[2],  agg$lo_95[2],     agg$hi_95[2]),
+                    ci_int(agg$agg_days[2], agg$agg_lo[2],    agg$agg_hi[2]),
+                    ci_ly(agg$agg_ly[2],    agg$agg_ly_lo[2], agg$agg_ly_hi[2])),
+  `Difference (95% CI)` = c(diff_count(n_elig1,    n_elig2),
+                            diff_count(n1,         n2),
+                            diff_count(n_wl1,      n_wl2),
+                            diff_count(n_match1,   n_match2),
+                            diff_count(n_match_r1, n_match_r2),
+                            diff_count(n_match_w1, n_match_w2),
+                            diff_count(n_tx_tot1,  n_tx_tot2),
+                            diff_se(wl1$est, wl2$est, wl1$se, wl2$se, ci_dpos),
+                            diff_se(surv1$wl$est, surv2$wl$est,
+                                    surv1$wl$se, surv2$wl$se, ci_pct_diff),
+                            diff_se(rc1$est, rc2$est, rc1$se, rc2$se, ci_dpos),
+                            diff_se(surv1$rc$est, surv2$rc$est,
+                                    surv1$rc$se, surv2$rc$se, ci_pct_diff),
+                            diff_se(agg$benefit[1],  agg$benefit[2],
+                                    se_d1, se_d2, ci_dpos),
+                            diff_se(agg$agg_days[1], agg$agg_days[2],
+                                    n1 * se_d1, n2 * se_d2, ci_int_signed),
+                            diff_se(agg$agg_ly[1],   agg$agg_ly[2],
+                                    n1 * se_d1 / 365.25, n2 * se_d2 / 365.25,
+                                    ci_ly_signed)),
+  `p (Pre vs Post)` = c("", "", "", "", "", "", "",
+                        fmt_pv(p_wl),
+                        fmt_pv(p_surv_wl),
+                        fmt_pv(p_rc),
+                        fmt_pv(p_surv_rc),
+                        fmt_pv(p_avg),
+                        fmt_pv(p_agg),
+                        fmt_pv(p_agg))
+)
+
+write.csv(agg_table, "kidney/agg_table.csv", row.names = FALSE)
+
+knitr::kable(
+  agg_table,
+  caption = paste("Aggregate 1-year survival benefit by policy period (kidney):",
+                  "transplant counts, per-arm RMSTs, average benefit per",
+                  "transplant (RMST recipients - RMST waitlisted), and",
+                  "aggregate benefit (N transplants x average benefit).",
+                  "Values are point estimate (95% CI). p-values: chi-square",
+                  "(N transplants), Student's t-test (RMSTs and benefit metrics).")
+)
+```
+
+```{r aggregate_forest, dependson="aggregate_benefit", fig.width=5, fig.height=4, results='asis', echo=FALSE}
+agg_forest <- agg %>%
+  select(cohort, est = agg_days, lo = agg_lo, hi = agg_hi) %>%
+  mutate(cohort = factor(cohort, levels = c("Pre-Policy", "Post-Policy")))
+
+cohort_vals <- c("Pre-Policy" = "#374E55", "Post-Policy" = "#DF8F44")
+
+cat("Aggregate Survival Benefit of Kidney Transplantation\n\n")
+ggplot(agg_forest, aes(x = cohort, y = est, fill = cohort)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                width = 0.2, lwd = 0.5, color = "gray30") +
+  scale_x_discrete(labels = c("Pre-Policy" = "Pre-policy", "Post-Policy" = "Post-policy")) +
+  scale_fill_manual(values = cohort_vals, name = NULL) +
+  scale_y_continuous(labels = scales::comma,
+                     limits = c(0, ceiling(max(agg_forest$hi) / 10000) * 10000)) +
+  labs(x = NULL, y = "Aggregate survival benefit (days)") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        legend.position = "none")
+```
+
+```{r comparison_km_overlay_zoom, fig.width=9, fig.height=6, dpi=300}
+# Overlay of Pre- and Post-Policy KM curves zoomed to 50%-100% with a
+# number-at-risk table below the plot.
+pre_short  <- "Pre-Policy"
+post_short <- "Post-Policy"
+
+combo_levels <- c("Pre-policy waiting list",
+                  "Pre-policy transplant",
+                  "Post-policy waiting list",
+                  "Post-policy transplant")
+
+kdf_overlay <- bind_rows(
+  mutate(kdf1, cohort = pre_short),
+  mutate(kdf2, cohort = post_short)
+) %>%
+  mutate(cohort = factor(cohort, levels = c(pre_short, post_short)),
+         cohort_lab = recode(as.character(cohort),
+                             "Pre-Policy"  = "Pre-policy",
+                             "Post-Policy" = "Post-policy"),
+         arm_lab    = recode(as.character(group),
+                             "Transplant recipient" = "transplant",
+                             "Waitlisted"           = "waiting list"),
+         combo = factor(paste(cohort_lab, arm_lab), levels = combo_levels))
+
+combo_colors <- c("Pre-policy waiting list"    = "#374E55",
+                  "Pre-policy transplant"  = "#374E55",
+                  "Post-policy waiting list"   = "#DF8F44",
+                  "Post-policy transplant" = "#DF8F44")
+combo_lty <- c("Pre-policy waiting list"    = "solid",
+               "Pre-policy transplant"  = "dashed",
+               "Post-policy waiting list"   = "solid",
+               "Post-policy transplant" = "dashed")
+
+# Log-rank tests comparing Pre-Policy vs Post-Policy KM curves within each
+# arm (transplant recipients, waitlisted) of the matched cohort.
+logrank_p_arm <- function(d) {
+  sd <- survdiff(Surv(follow_days_1y, dead_1y) ~ cohort, data = d)
+  pchisq(sd$chisq, df = length(sd$n) - 1, lower.tail = FALSE)
+}
+fmt_lr_p <- function(p) if (p < 0.001) "P < 0.001" else if (p < 0.01) sprintf("P = %.3f", p) else sprintf("P = %.2f", p)
+combined_matched_km <- bind_rows(
+  matched1 %>% mutate(cohort = "Pre-Policy"),
+  matched2 %>% mutate(cohort = "Post-Policy")
+)
+p_lr_tx <- logrank_p_arm(combined_matched_km %>% filter(transplanted == 1))
+p_lr_wl <- logrank_p_arm(combined_matched_km %>% filter(transplanted == 0))
+lab_lr_tx <- paste0("Transplant: log-rank ",   fmt_lr_p(p_lr_tx))
+lab_lr_wl <- paste0("Waiting list: log-rank ", fmt_lr_p(p_lr_wl))
+cat("Log-rank tests: Pre-Policy vs Post-Policy KM curves (matched cohort)\n")
+cat(sprintf("  %s\n", lab_lr_tx))
+cat(sprintf("  %s\n", lab_lr_wl))
+
+library(patchwork)
+
+risk_months <- 0:12
+# Query at the exact follow-up cap (365 d) for month 12 so the column shows
+# the count still under observation at 12 months instead of zero past the
+# max follow-up time (12 * 30.44 = 365.28 > 365).
+risk_days   <- pmin(risk_months * 30.44, 365)
+
+get_risk <- function(fit, cohort_label, times_days) {
+  s <- summary(fit, times = times_days, extend = TRUE)
+  data.frame(
+    time_months = s$time / 30.44,
+    n_risk      = s$n.risk,
+    strata      = as.character(s$strata),
+    cohort      = cohort_label
+  )
+}
+
+risk_df <- bind_rows(
+  get_risk(fit1, "Pre-Policy",  risk_days),
+  get_risk(fit2, "Post-Policy", risk_days)
+) %>%
+  mutate(group  = factor(recode(strata,
+                                "transplanted=0" = "Waitlisted",
+                                "transplanted=1" = "Transplant recipient"),
+                         levels = c("Transplant recipient", "Waitlisted")),
+         cohort = factor(cohort, levels = c("Pre-Policy", "Post-Policy")),
+         cohort_label = recode(as.character(cohort),
+                               "Pre-Policy"  = "Pre-policy",
+                               "Post-Policy" = "Post-policy"),
+         arm_label    = recode(as.character(group),
+                               "Transplant recipient" = "transplant",
+                               "Waitlisted"           = "waiting list"),
+         row_label    = paste(cohort_label, arm_label))
+
+row_levels <- c("Pre-policy transplant",
+                "Pre-policy waiting list",
+                "Post-policy transplant",
+                "Post-policy waiting list")
+risk_df$row_label <- factor(risk_df$row_label, levels = rev(row_levels))
+
+x_expand <- expansion(add = c(0.5, 0.6))
+
+p_km <- ggplot(kdf_overlay,
+       aes(x = time / 30.44, y = surv,
+           color = combo, linetype = combo, group = combo)) +
+  geom_step(linewidth = 0.9) +
+  scale_x_continuous(limits = c(0, 365 / 30.44), breaks = 0:12,
+                     expand = x_expand) +
+  scale_y_continuous(labels = function(x) sprintf("%.2f", x),
+                     breaks = seq(0.6, 1, 0.1),
+                     expand = expansion(mult = c(0, 0.02))) +
+  coord_cartesian(ylim = c(0.55, 1)) +
+  scale_color_manual(values = combo_colors, name = NULL) +
+  scale_linetype_manual(values = combo_lty, name = NULL) +
+  guides(color    = guide_legend(nrow = 2, byrow = TRUE),
+         linetype = guide_legend(nrow = 2, byrow = TRUE)) +
+  annotate("text", x = 0.5, y = 0.62, label = lab_lr_tx,
+           hjust = 0, vjust = 0, size = 4.5) +
+  annotate("text", x = 0.5, y = 0.58, label = lab_lr_wl,
+           hjust = 0, vjust = 0, size = 4.5) +
+  labs(x = "Time, mo", y = "Survival probability") +
+  theme_bw(base_size = 12) +
+  theme(legend.position  = "bottom",
+        panel.grid.minor = element_blank(),
+        legend.key.width = unit(1.4, "cm"),
+        axis.title.y     = element_text(margin = margin(r = 2)),
+        axis.text.y      = element_text(margin = margin(r = 2)),
+        axis.title.x     = element_text(margin = margin(t = 2)))
+
+p_risk <- ggplot(risk_df,
+       aes(x = time_months, y = row_label,
+           label = scales::comma(n_risk))) +
+  geom_text(size = 3, hjust = 0.5, color = "black") +
+  scale_x_continuous(limits = c(0, 365 / 30.44), breaks = 0:12,
+                     expand = x_expand) +
+  labs(x = NULL, y = NULL, title = "Number at risk") +
+  theme_bw(base_size = 10) +
+  theme(panel.grid    = element_blank(),
+        panel.border  = element_blank(),
+        axis.ticks    = element_blank(),
+        axis.line     = element_blank(),
+        axis.text.x   = element_blank(),
+        plot.title    = element_text(size = 11, face = "plain"))
+
+overlay_zoom <- p_km / p_risk + plot_layout(heights = c(3, 1))
+overlay_zoom
+```
+
+```{r cuminc_transplant, dependson="load_cohorts", fig.width=8, fig.height=5}
+# Cumulative incidence of transplantation from listing date, with death
+# without transplant treated as a competing event.
+build_ci_df <- function(cohort_df, cohort_label) {
+  cohort_df %>%
+    mutate(
+      days_to_tx = as.numeric(tx_date - list_date),
+      tx_within_1y    = !is.na(days_to_tx) & days_to_tx <= 365 & days_to_tx >= 0,
+      time = case_when(
+        tx_within_1y ~ days_to_tx,
+        TRUE         ~ pmin(follow_days_1y, 365)
+      ),
+      event = case_when(
+        tx_within_1y         ~ "transplant",
+        dead_1y == 1 & !tx_within_1y ~ "death",
+        TRUE                 ~ "censor"
+      ),
+      event  = factor(event, levels = c("censor", "transplant", "death")),
+      cohort = cohort_label
+    ) %>%
+    filter(time > 0) %>%
+    select(time, event, cohort)
+}
+
+ci_pre  <- build_ci_df(cohort1, "Pre-Policy")
+ci_post <- build_ci_df(cohort2, "Post-Policy")
+ci_df   <- bind_rows(ci_pre, ci_post) %>%
+  mutate(cohort = factor(cohort, levels = c("Pre-Policy", "Post-Policy")))
+
+# Gray's K-sample test (cmprsk) comparing the transplant cumulative incidence
+# between Pre- and Post-Policy cohorts, accounting for death as a competing
+# event.
+gray_res <- cmprsk::cuminc(ftime   = ci_df$time,
+                           fstatus = as.character(ci_df$event),
+                           group   = as.character(ci_df$cohort),
+                           cencode = "censor")
+gray_p   <- as.data.frame(gray_res$Tests)["transplant", "pv"]
+gray_lbl <- if (gray_p < 0.001) "Gray's test P < 0.001" else if (gray_p < 0.01) sprintf("Gray's test P = %.3f", gray_p) else sprintf("Gray's test P = %.2f", gray_p)
+cat(sprintf("Gray's test (Pre vs Post CIF of transplantation): p = %s\n",
+            if (gray_p < 0.001) "<0.001" else if (gray_p < 0.01) sprintf("%.3f", gray_p) else sprintf("%.2f", gray_p)))
+
+fit_ci <- survfit(Surv(time, event) ~ cohort, data = ci_df)
+
+state_idx <- which(fit_ci$states == "transplant")
+strata_n  <- fit_ci$strata
+strata_id <- rep(names(strata_n), strata_n)
+strata_id <- sub("^cohort=", "", strata_id)
+
+ci_plot_df <- tibble(
+  time   = fit_ci$time,
+  cif    = fit_ci$pstate[, state_idx],
+  cohort = factor(strata_id, levels = c("Pre-Policy", "Post-Policy"))
+)
+ci_plot_df <- bind_rows(
+  tibble(time = 0, cif = 0,
+         cohort = factor(c("Pre-Policy", "Post-Policy"),
+                         levels = c("Pre-Policy", "Post-Policy"))),
+  ci_plot_df
+) %>% arrange(cohort, time)
+
+ci_cohort_colors <- c("Pre-Policy" = "#374E55", "Post-Policy" = "#DF8F44")
+ci_cohort_lty    <- c("Pre-Policy" = "solid",   "Post-Policy" = "solid")
+
+ggplot(ci_plot_df, aes(x = time / 30.44, y = cif,
+                        color = cohort, linetype = cohort, group = cohort)) +
+  geom_step(linewidth = 0.9) +
+  scale_x_continuous(limits = c(0, 365 / 30.44),
+                     breaks = 0:12,
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = function(x) sprintf("%.2f", x),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_color_manual(values = ci_cohort_colors, name = NULL) +
+  scale_linetype_manual(values = ci_cohort_lty, name = NULL) +
+  guides(color    = guide_legend(nrow = 1),
+         linetype = guide_legend(nrow = 1)) +
+  annotate("text", x = 365 / 30.44, y = 0.02,
+           label = gray_lbl, hjust = 1, vjust = 0, size = 5) +
+  labs(x = "Time, mo",
+       y = "Cumulative incidence") +
+  theme_bw(base_size = 12) +
+  theme(legend.position  = "bottom",
+        panel.grid.minor = element_blank(),
+        legend.key.width = unit(1.4, "cm"))
+
+# Point estimates: 12-month CIF (t = 365 d) with 95% CI per cohort.
+s_at_12mo      <- summary(fit_ci, times = 365, extend = TRUE)
+state_idx_12mo <- which(s_at_12mo$states == "transplant")
+strata_lbl_12mo <- sub("^cohort=", "", as.character(s_at_12mo$strata))
+
+ci_12mo_tbl <- tibble(
+  Cohort = strata_lbl_12mo,
+  `CIF at 12 mo (95% CI)` = sprintf("%.1f%% (%.1f%%, %.1f%%)",
+                                     100 * s_at_12mo$pstate[, state_idx_12mo],
+                                     100 * s_at_12mo$lower[,  state_idx_12mo],
+                                     100 * s_at_12mo$upper[,  state_idx_12mo])
+)
+print(knitr::kable(
+  ci_12mo_tbl,
+  caption = paste("Cumulative incidence of transplantation at 12 months",
+                  "(Aalen-Johansen estimator, death as competing event)."),
+  align = "lr"
+))
+```
+
+
+# Sensitivity Analyses
+
+
+
+## Unmatched Analysis (No Propensity Score Matching)
+
+Replicate the matched-cohort analysis on the full eligible cohort
+(post-exclusion) with no propensity score matching. Waitlisted candidates
+are compared directly to transplant recipients within each policy period;
+1-year RMST and survival benefit are unadjusted.
+
+```{r unmatched_rmst, dependson="load_cohorts"}
+rmst1_unm <- rmst2(time = cohort1$follow_days_1y, status = cohort1$dead_1y,
+                   arm  = cohort1$transplanted, tau = 365)
+rmst2_unm <- rmst2(time = cohort2$follow_days_1y, status = cohort2$dead_1y,
+                   arm  = cohort2$transplanted, tau = 365)
+cat("Pre-Policy unmatched 1-year RMST (tau = 365 days):\n")
+print_benefit(rmst1_unm)
+cat("\nPost-Policy unmatched 1-year RMST:\n")
+print_benefit(rmst2_unm)
+```
+
+```{r unmatched_aggregate_benefit, dependson="unmatched_rmst"}
+# Transposed aggregate-benefit table on the unmatched eligible cohorts.
+n1_unm <- sum(cohort1$transplanted)
+n2_unm <- sum(cohort2$transplanted)
+
+agg_unm <- bind_rows(
+  rmst_row(rmst1_unm, "Pre-Policy"),
+  rmst_row(rmst2_unm, "Post-Policy")
+) %>%
+  mutate(
+    n_tx      = c(n1_unm, n2_unm),
+    agg_days  = n_tx * benefit,
+    agg_lo    = n_tx * lo_95,
+    agg_hi    = n_tx * hi_95,
+    agg_ly    = agg_days / 365.25,
+    agg_ly_lo = agg_lo   / 365.25,
+    agg_ly_hi = agg_hi   / 365.25
+  )
+
+wl1_unm <- arm_rmst(rmst1_unm, 0); wl2_unm <- arm_rmst(rmst2_unm, 0)
+rc1_unm <- arm_rmst(rmst1_unm, 1); rc2_unm <- arm_rmst(rmst2_unm, 1)
+se_d1_unm <- se_rmst_diff(rmst1_unm)
+se_d2_unm <- se_rmst_diff(rmst2_unm)
+
+# 1-year (365-day) survival probability per arm on the unmatched eligible cohort.
+fit1_surv_unm <- survfit(Surv(follow_days_1y, dead_1y) ~ transplanted, data = cohort1)
+fit2_surv_unm <- survfit(Surv(follow_days_1y, dead_1y) ~ transplanted, data = cohort2)
+surv1_unm <- get_surv_at_365(fit1_surv_unm)
+surv2_unm <- get_surv_at_365(fit2_surv_unm)
+
+# The sensitivity_tau chunk earlier in the file rebinds ci_d / ci_dpos / ci_ly
+# to single-argument versions (taking an rmst row). Re-bind the 3-argument
+# versions used by aggregate_benefit so the unmatched table can reuse the
+# same formatting conventions.
+ci_d    <- function(est, lo, hi) sprintf("%.1f (%.1f, %.1f)", est, lo, hi)
+ci_dpos <- function(est, lo, hi) sprintf("%+.1f (%+.1f, %+.1f)", est, lo, hi)
+ci_int  <- function(est, lo, hi) sprintf("%s (%s, %s)",
+                                          comma(round(est)),
+                                          comma(round(lo)), comma(round(hi)))
+ci_ly   <- function(est, lo, hi) sprintf("%.0f (%.0f, %.0f)", est, lo, hi)
+
+# Student's t-test for Pre vs Post; df = full eligible cohort sizes - 2.
+df_t_unm    <- nrow(cohort1) + nrow(cohort2) - 2
+ttest_p_unm <- function(pre, post, se_pre, se_post) {
+  t_stat <- (post - pre) / sqrt(se_pre^2 + se_post^2)
+  2 * pt(-abs(t_stat), df = df_t_unm)
+}
+
+p_wl_unm       <- ttest_p_unm(wl1_unm$est,         wl2_unm$est,         wl1_unm$se,        wl2_unm$se)
+p_rc_unm       <- ttest_p_unm(rc1_unm$est,         rc2_unm$est,         rc1_unm$se,        rc2_unm$se)
+p_surv_wl_unm  <- logrank_p_prepost(cohort1 %>% filter(transplanted == 0),
+                                    cohort2 %>% filter(transplanted == 0))
+p_surv_rc_unm  <- logrank_p_prepost(cohort1 %>% filter(transplanted == 1),
+                                    cohort2 %>% filter(transplanted == 1))
+diff1_unm_est <- unname(rmst1_unm$unadjusted.result["RMST (arm=1)-(arm=0)", "Est."])
+diff2_unm_est <- unname(rmst2_unm$unadjusted.result["RMST (arm=1)-(arm=0)", "Est."])
+p_avg_unm <- ttest_p_unm(diff1_unm_est,            diff2_unm_est,            se_d1_unm,         se_d2_unm)
+p_agg_unm <- ttest_p_unm(n1_unm * diff1_unm_est,   n2_unm * diff2_unm_est,   n1_unm * se_d1_unm, n2_unm * se_d2_unm)
+
+ct_unm    <- matrix(c(n1_unm, nrow(cohort1) - n1_unm,
+                      n2_unm, nrow(cohort2) - n2_unm), nrow = 2)
+p_ntx_unm <- chisq.test(ct_unm, correct = FALSE)$p.value
+
+agg_table_unm <- tibble(
+  ` ` = c("N eligible candidates",
+          "N eligible recipients",
+          "N eligible waitlisted",
+          "RMST waitlisted (days)",
+          "1-year survival, waitlisted (%)",
+          "RMST recipients (days)",
+          "1-year survival, recipients (%)",
+          "Avg benefit per tx (days)",
+          "Aggregate benefit (days)",
+          "Aggregate benefit (life-years)"),
+  `Pre-Policy` = c(comma(nrow(cohort1)),
+                   comma(n1_unm),
+                   comma(nrow(cohort1) - n1_unm),
+                   ci_d(wl1_unm$est, wl1_unm$lo, wl1_unm$hi),
+                   ci_pct(surv1_unm$wl$est, surv1_unm$wl$lo, surv1_unm$wl$hi),
+                   ci_d(rc1_unm$est, rc1_unm$lo, rc1_unm$hi),
+                   ci_pct(surv1_unm$rc$est, surv1_unm$rc$lo, surv1_unm$rc$hi),
+                   ci_dpos(agg_unm$benefit[1],  agg_unm$lo_95[1],     agg_unm$hi_95[1]),
+                   ci_int(agg_unm$agg_days[1], agg_unm$agg_lo[1],    agg_unm$agg_hi[1]),
+                   ci_ly(agg_unm$agg_ly[1],    agg_unm$agg_ly_lo[1], agg_unm$agg_ly_hi[1])),
+  `Post-Policy` = c(comma(nrow(cohort2)),
+                    comma(n2_unm),
+                    comma(nrow(cohort2) - n2_unm),
+                    ci_d(wl2_unm$est, wl2_unm$lo, wl2_unm$hi),
+                    ci_pct(surv2_unm$wl$est, surv2_unm$wl$lo, surv2_unm$wl$hi),
+                    ci_d(rc2_unm$est, rc2_unm$lo, rc2_unm$hi),
+                    ci_pct(surv2_unm$rc$est, surv2_unm$rc$lo, surv2_unm$rc$hi),
+                    ci_dpos(agg_unm$benefit[2],  agg_unm$lo_95[2],     agg_unm$hi_95[2]),
+                    ci_int(agg_unm$agg_days[2], agg_unm$agg_lo[2],    agg_unm$agg_hi[2]),
+                    ci_ly(agg_unm$agg_ly[2],    agg_unm$agg_ly_lo[2], agg_unm$agg_ly_hi[2])),
+  `p (Pre vs Post)` = c("", "", "",
+                        fmt_pv(p_wl_unm),
+                        fmt_pv(p_surv_wl_unm),
+                        fmt_pv(p_rc_unm),
+                        fmt_pv(p_surv_rc_unm),
+                        fmt_pv(p_avg_unm),
+                        fmt_pv(p_agg_unm),
+                        fmt_pv(p_agg_unm))
+)
+
+knitr::kable(
+  agg_table_unm,
+  caption = paste("Unmatched supplemental analysis (kidney): full eligible",
+                  "cohort, no propensity score matching. 1-year RMST per arm,",
+                  "average benefit per transplant, and aggregate benefit.",
+                  "Values are point estimate (95% CI). p-values: chi-square",
+                  "(N transplants), Student's t-test (RMSTs and benefit metrics).")
+)
+```
+
+
+## Shorter Time Horizon ($\tau$ = 180 days)
+
+Repeat the matched-cohort RMST analyses at a shorter time horizon ($\tau$ = 180 days)
+to confirm that the Kidney-transplantation survival benefit is not driven by a particular
+truncation choice.
+
+```{r sensitivity_tau, dependson=c("cohort1_rmst","cohort2_rmst","aggregate_benefit")}
+get_rmst_res <- function(matched_data, n_tx, tau) {
+  r <- rmst2(matched_data$follow_days_1y, matched_data$dead_1y,
+             matched_data$transplanted, tau = tau)
+  # KM survival per arm at t = tau (back-calculated SE from symmetric 95% CI).
+  fit <- survfit(Surv(follow_days_1y, dead_1y) ~ transplanted,
+                 data = matched_data)
+  s   <- summary(fit, times = tau, extend = TRUE)
+  idx0 <- grepl("transplanted=0", as.character(s$strata))
+  idx1 <- grepl("transplanted=1", as.character(s$strata))
+  surv_wl <- list(est = s$surv[idx0], lo = s$lower[idx0], hi = s$upper[idx0],
+                  se  = (s$upper[idx0] - s$lower[idx0]) / (2 * 1.96))
+  surv_rc <- list(est = s$surv[idx1], lo = s$lower[idx1], hi = s$upper[idx1],
+                  se  = (s$upper[idx1] - s$lower[idx1]) / (2 * 1.96))
+  list(
+    wl        = r$RMST.arm0$rmst,
+    rc        = r$RMST.arm1$rmst,
+    diff      = r$unadjusted.result["RMST (arm=1)-(arm=0)", ],
+    surv_wl   = surv_wl,
+    surv_rc   = surv_rc,
+    n_tx      = n_tx,
+    n_matched = nrow(matched_data),
+    tau       = tau
+  )
+}
+
+# Student's t-test helper for Pre vs Post comparison.
+cmp_pre_post <- function(pre, post) {
+  se_wl_pre  <- unname((pre$wl["upper .95"]    - pre$wl["lower .95"])    / (2 * 1.96))
+  se_wl_post <- unname((post$wl["upper .95"]   - post$wl["lower .95"])   / (2 * 1.96))
+  se_rc_pre  <- unname((pre$rc["upper .95"]    - pre$rc["lower .95"])    / (2 * 1.96))
+  se_rc_post <- unname((post$rc["upper .95"]   - post$rc["lower .95"])   / (2 * 1.96))
+  se_d_pre   <- unname((pre$diff["upper .95"]  - pre$diff["lower .95"])  / (2 * 1.96))
+  se_d_post  <- unname((post$diff["upper .95"] - post$diff["lower .95"]) / (2 * 1.96))
+
+  d_wl       <- unname(post$wl["Est."]   - pre$wl["Est."])
+  d_rc       <- unname(post$rc["Est."]   - pre$rc["Est."])
+  d_avg      <- unname(post$diff["Est."] - pre$diff["Est."])
+  d_agg      <- unname(post$n_tx * post$diff["Est."] - pre$n_tx * pre$diff["Est."])
+  d_surv_wl  <- post$surv_wl$est - pre$surv_wl$est
+  d_surv_rc  <- post$surv_rc$est - pre$surv_rc$est
+
+  df_t  <- pre$n_matched + post$n_matched - 2
+  ttest <- function(d, se) 2 * pt(-abs(d / se), df = df_t)
+  list(
+    p_wl      = ttest(d_wl,      sqrt(se_wl_pre^2 + se_wl_post^2)),
+    p_rc      = ttest(d_rc,      sqrt(se_rc_pre^2 + se_rc_post^2)),
+    p_avg     = ttest(d_avg,     sqrt(se_d_pre^2  + se_d_post^2)),
+    p_agg     = ttest(d_agg,     sqrt((pre$n_tx * se_d_pre)^2 + (post$n_tx * se_d_post)^2)),
+    p_surv_wl = ttest(d_surv_wl, sqrt(pre$surv_wl$se^2 + post$surv_wl$se^2)),
+    p_surv_rc = ttest(d_surv_rc, sqrt(pre$surv_rc$se^2 + post$surv_rc$se^2)),
+    d_avg = d_avg, d_agg = d_agg
+  )
+}
+
+fmt_p   <- function(p) ifelse(is.na(p), "", ifelse(p < 0.001, "<0.001", ifelse(p < 0.01, sprintf("%.3f", p), sprintf("%.2f", p))))
+ci_d    <- function(x) sprintf("%.1f (%.1f, %.1f)", x["Est."], x["lower .95"], x["upper .95"])
+ci_dpos <- function(x) sprintf("%+.1f (%+.1f, %+.1f)", x["Est."], x["lower .95"], x["upper .95"])
+ci_agg  <- function(n_tx, x) sprintf("%s (%s, %s)",
+                                      comma(round(n_tx * x["Est."])),
+                                      comma(round(n_tx * x["lower .95"])),
+                                      comma(round(n_tx * x["upper .95"])))
+ci_ly   <- function(n_tx, x) sprintf("%.1f (%.1f, %.1f)",
+                                      n_tx * x["Est."]      / 365.25,
+                                      n_tx * x["lower .95"] / 365.25,
+                                      n_tx * x["upper .95"] / 365.25)
+ci_surv <- function(surv) sprintf("%.1f%% (%.1f%%, %.1f%%)",
+                                  100 * surv$est, 100 * surv$lo, 100 * surv$hi)
+
+build_three_col <- function(pre, post, cmp) {
+  tibble(
+    Pre  = c(ci_d(pre$wl),  ci_surv(pre$surv_wl),
+             ci_d(pre$rc),  ci_surv(pre$surv_rc),
+             ci_dpos(pre$diff),
+             ci_agg(pre$n_tx, pre$diff),  ci_ly(pre$n_tx, pre$diff)),
+    Post = c(ci_d(post$wl), ci_surv(post$surv_wl),
+             ci_d(post$rc), ci_surv(post$surv_rc),
+             ci_dpos(post$diff),
+             ci_agg(post$n_tx, post$diff), ci_ly(post$n_tx, post$diff)),
+    p    = c(fmt_p(cmp$p_wl),      fmt_p(cmp$p_surv_wl),
+             fmt_p(cmp$p_rc),      fmt_p(cmp$p_surv_rc),
+             fmt_p(cmp$p_avg),
+             fmt_p(cmp$p_agg),     fmt_p(cmp$p_agg))
+  )
+}
+
+n1 <- sum(cohort1$transplanted)
+n2 <- sum(cohort2$transplanted)
+
+res_pre_180  <- get_rmst_res(matched1, n1, 180)
+res_post_180 <- get_rmst_res(matched2, n2, 180)
+
+cmp_180 <- cmp_pre_post(res_pre_180, res_post_180)
+
+tab_180 <- build_three_col(res_pre_180, res_post_180, cmp_180)
+
+# Replace the survival-row p-values (positions 2 and 4 within the 7-element
+# outcome block) with log-rank tests truncated at tau = 180.
+p_surv_wl_180_lr <- logrank_p_prepost(matched1 %>% filter(transplanted == 0),
+                                      matched2 %>% filter(transplanted == 0),
+                                      tau = 180)
+p_surv_rc_180_lr <- logrank_p_prepost(matched1 %>% filter(transplanted == 1),
+                                      matched2 %>% filter(transplanted == 1),
+                                      tau = 180)
+tab_180$p[2] <- fmt_p(p_surv_wl_180_lr)
+tab_180$p[4] <- fmt_p(p_surv_rc_180_lr)
+
+# N rows (p-values blanked: chi-square on counts not reported)
+n_pre_strs  <- c(comma(n_elig1),    comma(n1),         comma(n_wl1),
+                 comma(n_match1),   comma(n_match_r1), comma(n_match_w1),
+                 comma(n_tx_tot1))
+n_post_strs <- c(comma(n_elig2),    comma(n2),         comma(n_wl2),
+                 comma(n_match2),   comma(n_match_r2), comma(n_match_w2),
+                 comma(n_tx_tot2))
+n_p_strs    <- rep("", 7)
+
+sens_table <- tibble(
+  ` ` = c("N eligible candidates",
+          "N eligible recipients",
+          "N eligible waitlisted",
+          "N matched candidates",
+          "N matched recipients",
+          "N matched waitlisted",
+          "N transplants",
+          "Waitlist RMST (days)", "6-month survival, waitlisted (%)",
+          "Recipient RMST (days)", "6-month survival, recipients (%)",
+          "Avg benefit per tx (days)", "Aggregate benefit (days)",
+          "Aggregate benefit (life-years)"),
+  `tau=180 Pre`  = c(n_pre_strs,  tab_180$Pre),
+  `tau=180 Post` = c(n_post_strs, tab_180$Post),
+  `tau=180 p`    = c(n_p_strs,    tab_180$p)
+)
+
+knitr::kable(
+  sens_table,
+  caption = paste("Sensitivity analysis at shorter time horizon (kidney):",
+                  "per-arm RMSTs, average benefit per transplant, and aggregate",
+                  "benefit at tau = 180 days. Values are point estimate",
+                  "(95% CI); p-values: Student's t-test comparing Pre-Policy vs Post-Policy.")
+)
+```
+
+
+## 2-Year Survival Benefit (Restricted Cohort Windows)
+
+This supplemental analysis repeats the main 1-year analysis on narrower
+10-month listing windows so each candidate can be followed for two full years.
+Pre-Policy candidates are listed Aug 1, 2019–May 31, 2020; Post-Policy
+candidates are listed Aug 1, 2022–May 31, 2023. Survival is truncated at
+tau = 730 days. The pipeline mirrors the main analysis: same exclusions, same
+matching formula (`blood_type + age + region + list_day + on_dialysis +
+dialysis_days + diag`), RMST via `survRM2::rmst2()`.
+
+```{r supp2y_setup, cache.lazy=FALSE}
+# Restricted listing windows
+c1_supp_start <- as.Date("2019-08-01"); c1_supp_end <- as.Date("2020-05-31")
+c2_supp_start <- as.Date("2022-08-01"); c2_supp_end <- as.Date("2023-05-31")
+
+# cand_kipa is no longer in scope (cohort assembly moved to data_prep.Rmd); reload minimally for the
+# first-tx follow-up dates and the per-center transplant counts used by the
+# low-volume-center exclusion.
+supp_data_path <- "/Users/danieljohnson/Library/CloudStorage/Box-Box/Q1 2026 SAF/pubsaf2603/"
+tx_ki_supp <- read_sas(paste0(supp_data_path, "tx_ki.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels() %>%
+  select(PX_ID, REC_TX_DT, REC_CTR_CD, REC_TX_PROCEDURE_TY,
+         TFL_DEATH_DT, TFL_LAFUDATE)
+
+first_tx_supp <- tx_ki_supp %>%
+  arrange(PX_ID, REC_TX_DT) %>%
+  group_by(PX_ID) %>% slice(1) %>% ungroup() %>%
+  select(PX_ID, tfl_death_dt = TFL_DEATH_DT, tfl_lafudate = TFL_LAFUDATE)
+
+# cand_kipa is no longer loaded by this file (cohort assembly moved to
+# data_prep.Rmd); reload the minimal columns needed for death/follow-up dates.
+cand_kipa_supp <- read_sas(paste0(supp_data_path, "cand_kipa.sas7bdat"),
+                            col_select = c("PX_ID", "PERS_OPTN_DEATH_DT",
+                                           "PERS_SSA_DEATH_DT", "CAN_REM_DT")) %>%
+  zap_formats() %>% zap_labels()
+
+# 2-year follow-up: same death/last-follow-up logic as the main analysis,
+# but truncated at 730 days. admin_censor_2y matches the existing admin censor
+# for in_cohort_1 / in_cohort_2 (the windows leave a full 2 years of follow-up
+# beyond every restricted listing date). The Pre/Post-Policy `cohort` column
+# (already in cohort_combined from data_prep.Rmd) replaces the old
+# in_cohort_1 / in_cohort_2 flags.
+supp2y_base <- cohort_combined %>%
+  filter((cohort == "Pre-Policy"  & list_date >= c1_supp_start & list_date <= c1_supp_end) |
+         (cohort == "Post-Policy" & list_date >= c2_supp_start & list_date <= c2_supp_end)) %>%
+  mutate(supp_cohort = as.character(cohort)) %>%
+  left_join(cand_kipa_supp, by = "PX_ID") %>%
+  left_join(first_tx_supp, by = "PX_ID") %>%
+  mutate(
+    death_date = case_when(
+      !is.na(PERS_OPTN_DEATH_DT) ~ PERS_OPTN_DEATH_DT,
+      !is.na(PERS_SSA_DEATH_DT)  ~ PERS_SSA_DEATH_DT,
+      TRUE                       ~ NA_Date_
+    ),
+    last_fu_date = case_when(
+      transplanted == 1   ~ coalesce(tfl_lafudate, tfl_death_dt),
+      !is.na(CAN_REM_DT)  ~ CAN_REM_DT,
+      TRUE                ~ NA_Date_
+    ),
+    admin_censor_2y  = if_else(supp_cohort == "Pre-Policy",
+                                as.Date("2023-07-31"),
+                                as.Date("2025-07-31")),
+    days_to_admin_2y = as.numeric(admin_censor_2y - list_date),
+    days_to_death    = as.numeric(death_date - list_date),
+    days_to_fu       = as.numeric(last_fu_date - list_date),
+    dead_2y          = as.integer(!is.na(days_to_death) & days_to_death <= 730 &
+                                    days_to_death <= days_to_admin_2y),
+    follow_days_2y   = case_when(
+      dead_2y == 1       ~ pmin(days_to_death, 730),
+      !is.na(days_to_fu) ~ pmin(days_to_fu, 730, days_to_admin_2y),
+      TRUE               ~ pmin(730, days_to_admin_2y)
+    )
+  )
+
+cat("Restricted-window supplemental 2-year cohort sizes:\n")
+cat(sprintf("  Pre-Policy  (listed %s–%s): %s candidates\n",
+            format(c1_supp_start, "%b %d, %Y"),
+            format(c1_supp_end,   "%b %d, %Y"),
+            comma(sum(supp2y_base$supp_cohort == "Pre-Policy"))))
+cat(sprintf("  Post-Policy (listed %s–%s): %s candidates\n",
+            format(c2_supp_start, "%b %d, %Y"),
+            format(c2_supp_end,   "%b %d, %Y"),
+            comma(sum(supp2y_base$supp_cohort == "Post-Policy"))))
+```
+
+```{r supp2y_pre_setup, dependson="supp2y_setup"}
+# Exclusion 1: low-volume transplant center, recomputed for the 10-month
+# Pre-Policy restricted window (threshold: <= 2 adult tx / year).
+window_years_1_supp <- as.numeric(c1_supp_end - c1_supp_start) / 365.25
+low_vol_centers_1_supp <- tx_ki_supp %>%
+  filter(!is.na(REC_TX_DT),
+         REC_TX_DT >= c1_supp_start, REC_TX_DT <= c1_supp_end,
+         !is.na(REC_TX_PROCEDURE_TY)) %>%
+  count(REC_CTR_CD, name = "n_tx") %>%
+  mutate(n_tx_per_year = n_tx / window_years_1_supp) %>%
+  filter(n_tx_per_year <= 2) %>% pull(REC_CTR_CD)
+
+cat("Pre-Policy restricted cohort flow:\n")
+step0 <- supp2y_base %>% filter(supp_cohort == "Pre-Policy")
+cat(sprintf("  Listed in restricted window:                 %s\n",
+            comma(nrow(step0))))
+
+step1 <- step0 %>% filter(!ctr_cd %in% low_vol_centers_1_supp)
+cat(sprintf("    - Low-volume center (<= 2 tx/yr):         -%s\n",
+            comma(nrow(step0) - nrow(step1))))
+step2 <- step1 %>% filter(is_multi_organ == 0)
+cat(sprintf("    - Multi-organ candidate:                  -%s\n",
+            comma(nrow(step1) - nrow(step2))))
+step3 <- step2 %>% filter(inactive_throughout == 0)
+cat(sprintf("    - Inactive at listing & never active:     -%s\n",
+            comma(nrow(step2) - nrow(step3))))
+step4 <- step3 %>% filter(data_error == 0)
+cat(sprintf("    - Data entry errors:                      -%s\n",
+            comma(nrow(step3) - nrow(step4))))
+
+cohort1_supp <- step4 %>%
+  filter(follow_days_2y > 0) %>%
+  filter(!is.na(blood_type), !is.na(age), !is.na(region))
+cat(sprintf("    - Missing covariates / no follow-up:      -%s\n",
+            comma(nrow(step4) - nrow(cohort1_supp))))
+cat(sprintf("  Eligible Pre-Policy cohort:                  %s\n",
+            comma(nrow(cohort1_supp))))
+cat(sprintf("    Recipients:                                %s\n",
+            comma(sum(cohort1_supp$transplanted))))
+cat(sprintf("    Waitlisted controls:                       %s\n",
+            comma(sum(cohort1_supp$transplanted == 0))))
+cat(sprintf("    2-year deaths (overall):                   %s\n",
+            comma(sum(cohort1_supp$dead_2y))))
+```
+
+```{r supp2y_pre_match, dependson="supp2y_pre_setup"}
+set.seed(20210930)
+m1_supp <- matchit(
+  transplanted ~ blood_type + age + region + list_day +
+    on_dialysis + dialysis_days + diag,
+  data     = cohort1_supp,
+  method   = "nearest",
+  distance = "glm",
+  link     = "probit",
+  mahvars  = ~ age + list_day + on_dialysis + dialysis_days,
+  ratio    = 1,
+  replace  = FALSE
+)
+matched1_supp <- match.data(m1_supp)
+cat("Pre-Policy matched pairs:    ", comma(nrow(matched1_supp) / 2), "\n")
+cat("  2-year deaths (matched):   ", comma(sum(matched1_supp$dead_2y)), "\n")
+```
+
+```{r supp2y_pre_rmst, dependson="supp2y_pre_match", fig.width=8, fig.height=5}
+fit1_supp <- survfit(Surv(follow_days_2y, dead_2y) ~ transplanted,
+                     data    = matched1_supp,
+                     cluster = subclass)
+kdf1_supp <- km_to_df(fit1_supp, tau = 730)
+
+ggplot(kdf1_supp, aes(x = time / 30.44, y = surv, color = group)) +
+  geom_step(linewidth = 0.9) +
+  geom_step(aes(y = lower), linetype = "dashed", linewidth = 0.35) +
+  geom_step(aes(y = upper), linetype = "dashed", linewidth = 0.35) +
+  scale_x_continuous(limits = c(0, 730 / 30.44), breaks = seq(0, 24, 3),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(limits = c(0, 1),
+                     labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_color_manual(values = c("Transplant recipient" = "#2166ac",
+                                "Waitlisted"           = "#d6604d")) +
+  labs(x = "Time, mo", y = "Survival probability",
+       title = sprintf("Pre-Policy restricted: 2-Year Survival\n%s–%s",
+                       format(c1_supp_start, "%b %d, %Y"),
+                       format(c1_supp_end,   "%b %d, %Y")),
+       color = NULL) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+rmst1_supp <- rmst2(time   = matched1_supp$follow_days_2y,
+                    status = matched1_supp$dead_2y,
+                    arm    = matched1_supp$transplanted,
+                    tau    = 730)
+cat("2-year RMST from listing date (tau = 730 days):\n")
+print_benefit(rmst1_supp)
+```
+
+```{r supp2y_post_setup, dependson="supp2y_setup"}
+window_years_2_supp <- as.numeric(c2_supp_end - c2_supp_start) / 365.25
+low_vol_centers_2_supp <- tx_ki_supp %>%
+  filter(!is.na(REC_TX_DT),
+         REC_TX_DT >= c2_supp_start, REC_TX_DT <= c2_supp_end,
+         !is.na(REC_TX_PROCEDURE_TY)) %>%
+  count(REC_CTR_CD, name = "n_tx") %>%
+  mutate(n_tx_per_year = n_tx / window_years_2_supp) %>%
+  filter(n_tx_per_year <= 2) %>% pull(REC_CTR_CD)
+
+cat("Post-Policy restricted cohort flow:\n")
+step0 <- supp2y_base %>% filter(supp_cohort == "Post-Policy")
+cat(sprintf("  Listed in restricted window:                 %s\n",
+            comma(nrow(step0))))
+
+step1 <- step0 %>% filter(!ctr_cd %in% low_vol_centers_2_supp)
+cat(sprintf("    - Low-volume center (<= 2 tx/yr):         -%s\n",
+            comma(nrow(step0) - nrow(step1))))
+step2 <- step1 %>% filter(is_multi_organ == 0)
+cat(sprintf("    - Multi-organ candidate:                  -%s\n",
+            comma(nrow(step1) - nrow(step2))))
+step3 <- step2 %>% filter(inactive_throughout == 0)
+cat(sprintf("    - Inactive at listing & never active:     -%s\n",
+            comma(nrow(step2) - nrow(step3))))
+step4 <- step3 %>% filter(data_error == 0)
+cat(sprintf("    - Data entry errors:                      -%s\n",
+            comma(nrow(step3) - nrow(step4))))
+
+cohort2_supp <- step4 %>%
+  filter(follow_days_2y > 0) %>%
+  filter(!is.na(blood_type), !is.na(age), !is.na(region))
+cat(sprintf("    - Missing covariates / no follow-up:      -%s\n",
+            comma(nrow(step4) - nrow(cohort2_supp))))
+cat(sprintf("  Eligible Post-Policy cohort:                 %s\n",
+            comma(nrow(cohort2_supp))))
+cat(sprintf("    Recipients:                                %s\n",
+            comma(sum(cohort2_supp$transplanted))))
+cat(sprintf("    Waitlisted controls:                       %s\n",
+            comma(sum(cohort2_supp$transplanted == 0))))
+cat(sprintf("    2-year deaths (overall):                   %s\n",
+            comma(sum(cohort2_supp$dead_2y))))
+```
+
+```{r supp2y_post_match, dependson="supp2y_post_setup"}
+set.seed(20210930)
+m2_supp <- matchit(
+  transplanted ~ blood_type + age + region + list_day +
+    on_dialysis + dialysis_days + diag,
+  data     = cohort2_supp,
+  method   = "nearest",
+  distance = "glm",
+  link     = "probit",
+  mahvars  = ~ age + list_day + on_dialysis + dialysis_days,
+  ratio    = 1,
+  replace  = FALSE
+)
+matched2_supp <- match.data(m2_supp)
+cat("Post-Policy matched pairs:    ", comma(nrow(matched2_supp) / 2), "\n")
+cat("  2-year deaths (matched):    ", comma(sum(matched2_supp$dead_2y)), "\n")
+```
+
+```{r save_supp2y_cohorts, dependson=c("supp2y_pre_match","supp2y_post_match"), cache=FALSE}
+saveRDS(bind_rows(matched1_supp, matched2_supp), "matched_kidney_2y.rds")
+saveRDS(bind_rows(cohort1_supp,  cohort2_supp),  "cohort_kidney_2y.rds")
+```
+
+```{r supp2y_post_rmst, dependson="supp2y_post_match", fig.width=8, fig.height=5}
+fit2_supp <- survfit(Surv(follow_days_2y, dead_2y) ~ transplanted,
+                     data    = matched2_supp,
+                     cluster = subclass)
+kdf2_supp <- km_to_df(fit2_supp, tau = 730)
+
+ggplot(kdf2_supp, aes(x = time / 30.44, y = surv, color = group)) +
+  geom_step(linewidth = 0.9) +
+  geom_step(aes(y = lower), linetype = "dashed", linewidth = 0.35) +
+  geom_step(aes(y = upper), linetype = "dashed", linewidth = 0.35) +
+  scale_x_continuous(limits = c(0, 730 / 30.44), breaks = seq(0, 24, 3),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(limits = c(0, 1),
+                     labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_color_manual(values = c("Transplant recipient" = "#2166ac",
+                                "Waitlisted"           = "#d6604d")) +
+  labs(x = "Time, mo", y = "Survival probability",
+       title = sprintf("Post-Policy restricted: 2-Year Survival\n%s–%s",
+                       format(c2_supp_start, "%b %d, %Y"),
+                       format(c2_supp_end,   "%b %d, %Y")),
+       color = NULL) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+rmst2_supp <- rmst2(time   = matched2_supp$follow_days_2y,
+                    status = matched2_supp$dead_2y,
+                    arm    = matched2_supp$transplanted,
+                    tau    = 730)
+cat("2-year RMST from listing date (tau = 730 days):\n")
+print_benefit(rmst2_supp)
+```
+
+```{r supp2y_aggregate_benefit, dependson=c("supp2y_pre_rmst","supp2y_post_rmst")}
+n1_supp <- sum(cohort1_supp$transplanted)
+n2_supp <- sum(cohort2_supp$transplanted)
+
+agg_supp <- bind_rows(
+  rmst_row(rmst1_supp, "Pre-Policy"),
+  rmst_row(rmst2_supp, "Post-Policy")
+) %>%
+  mutate(
+    n_tx      = c(n1_supp, n2_supp),
+    agg_days  = n_tx * benefit,
+    agg_lo    = n_tx * lo_95,
+    agg_hi    = n_tx * hi_95,
+    agg_ly    = agg_days / 365.25,
+    agg_ly_lo = agg_lo   / 365.25,
+    agg_ly_hi = agg_hi   / 365.25
+  )
+
+wl1_supp <- arm_rmst(rmst1_supp, 0); wl2_supp <- arm_rmst(rmst2_supp, 0)
+rc1_supp <- arm_rmst(rmst1_supp, 1); rc2_supp <- arm_rmst(rmst2_supp, 1)
+
+# 2-year (730-day) KM survival per arm on the restricted matched cohorts.
+get_surv_at_t <- function(fit, t) {
+  s    <- summary(fit, times = t, extend = TRUE)
+  idx0 <- grepl("transplanted=0", as.character(s$strata))
+  idx1 <- grepl("transplanted=1", as.character(s$strata))
+  list(
+    wl = list(est = s$surv[idx0], lo = s$lower[idx0], hi = s$upper[idx0],
+              se  = (s$upper[idx0] - s$lower[idx0]) / (2 * 1.96)),
+    rc = list(est = s$surv[idx1], lo = s$lower[idx1], hi = s$upper[idx1],
+              se  = (s$upper[idx1] - s$lower[idx1]) / (2 * 1.96))
+  )
+}
+fit1_surv_supp <- survfit(Surv(follow_days_2y, dead_2y) ~ transplanted,
+                          data = matched1_supp, cluster = subclass)
+fit2_surv_supp <- survfit(Surv(follow_days_2y, dead_2y) ~ transplanted,
+                          data = matched2_supp, cluster = subclass)
+surv1_supp <- get_surv_at_t(fit1_surv_supp, 730)
+surv2_supp <- get_surv_at_t(fit2_surv_supp, 730)
+
+se_d1_supp <- se_rmst_diff(rmst1_supp)
+se_d2_supp <- se_rmst_diff(rmst2_supp)
+df_supp <- nrow(matched1_supp) + nrow(matched2_supp) - 2
+ttest_p_supp <- function(pre, post, se_pre, se_post) {
+  t_stat <- (post - pre) / sqrt(se_pre^2 + se_post^2)
+  2 * pt(-abs(t_stat), df = df_supp)
+}
+p_wl_supp       <- ttest_p_supp(wl1_supp$est, wl2_supp$est, wl1_supp$se, wl2_supp$se)
+p_rc_supp       <- ttest_p_supp(rc1_supp$est, rc2_supp$est, rc1_supp$se, rc2_supp$se)
+p_surv_wl_supp  <- logrank_p_prepost(matched1_supp %>% filter(transplanted == 0),
+                                     matched2_supp %>% filter(transplanted == 0),
+                                     time_col = "follow_days_2y",
+                                     event_col = "dead_2y")
+p_surv_rc_supp  <- logrank_p_prepost(matched1_supp %>% filter(transplanted == 1),
+                                     matched2_supp %>% filter(transplanted == 1),
+                                     time_col = "follow_days_2y",
+                                     event_col = "dead_2y")
+p_avg_supp <- ttest_p_supp(agg_supp$benefit[1],  agg_supp$benefit[2],
+                           se_d1_supp,           se_d2_supp)
+p_agg_supp <- ttest_p_supp(agg_supp$agg_days[1], agg_supp$agg_days[2],
+                           n1_supp * se_d1_supp, n2_supp * se_d2_supp)
+
+ct_supp    <- matrix(c(n1_supp, nrow(cohort1_supp) - n1_supp,
+                       n2_supp, nrow(cohort2_supp) - n2_supp), nrow = 2)
+p_ntx_supp <- chisq.test(ct_supp, correct = FALSE)$p.value
+
+ci_d3    <- function(est, lo, hi) sprintf("%.1f (%.1f, %.1f)", est, lo, hi)
+ci_dpos3 <- function(est, lo, hi) sprintf("%+.1f (%+.1f, %+.1f)", est, lo, hi)
+ci_int3  <- function(est, lo, hi) sprintf("%s (%s, %s)",
+                                            comma(round(est)),
+                                            comma(round(lo)), comma(round(hi)))
+ci_ly3   <- function(est, lo, hi) sprintf("%.0f (%.0f, %.0f)", est, lo, hi)
+fmt_pv3  <- function(p) ifelse(is.na(p), "", ifelse(p < 0.001, "<0.001", ifelse(p < 0.01, sprintf("%.3f", p), sprintf("%.2f", p))))
+
+n_elig1_supp  <- nrow(cohort1_supp);  n_elig2_supp <- nrow(cohort2_supp)
+n_match1_supp <- nrow(matched1_supp); n_match2_supp <- nrow(matched2_supp)
+
+supp_table <- tibble(
+  ` ` = c("N eligible candidates", "N eligible recipients", "N eligible waitlisted",
+          "N matched candidates",  "N matched recipients",  "N matched waitlisted",
+          "N transplants",
+          "RMST waitlisted (days)", "2-year survival, waitlisted (%)",
+          "RMST recipients (days)", "2-year survival, recipients (%)",
+          "Avg benefit per tx (days)",
+          "Aggregate benefit (days)", "Aggregate benefit (life-years)"),
+  `Pre-Policy` = c(comma(n_elig1_supp),
+                   comma(n1_supp),
+                   comma(n_elig1_supp - n1_supp),
+                   comma(n_match1_supp),
+                   comma(sum(matched1_supp$transplanted)),
+                   comma(sum(matched1_supp$transplanted == 0)),
+                   comma(n1_supp),
+                   ci_d3(wl1_supp$est, wl1_supp$lo, wl1_supp$hi),
+                   ci_pct(surv1_supp$wl$est, surv1_supp$wl$lo, surv1_supp$wl$hi),
+                   ci_d3(rc1_supp$est, rc1_supp$lo, rc1_supp$hi),
+                   ci_pct(surv1_supp$rc$est, surv1_supp$rc$lo, surv1_supp$rc$hi),
+                   ci_dpos3(agg_supp$benefit[1], agg_supp$lo_95[1], agg_supp$hi_95[1]),
+                   ci_int3(agg_supp$agg_days[1], agg_supp$agg_lo[1], agg_supp$agg_hi[1]),
+                   ci_ly3(agg_supp$agg_ly[1],    agg_supp$agg_ly_lo[1], agg_supp$agg_ly_hi[1])),
+  `Post-Policy` = c(comma(n_elig2_supp),
+                    comma(n2_supp),
+                    comma(n_elig2_supp - n2_supp),
+                    comma(n_match2_supp),
+                    comma(sum(matched2_supp$transplanted)),
+                    comma(sum(matched2_supp$transplanted == 0)),
+                    comma(n2_supp),
+                    ci_d3(wl2_supp$est, wl2_supp$lo, wl2_supp$hi),
+                    ci_pct(surv2_supp$wl$est, surv2_supp$wl$lo, surv2_supp$wl$hi),
+                    ci_d3(rc2_supp$est, rc2_supp$lo, rc2_supp$hi),
+                    ci_pct(surv2_supp$rc$est, surv2_supp$rc$lo, surv2_supp$rc$hi),
+                    ci_dpos3(agg_supp$benefit[2], agg_supp$lo_95[2], agg_supp$hi_95[2]),
+                    ci_int3(agg_supp$agg_days[2], agg_supp$agg_lo[2], agg_supp$agg_hi[2]),
+                    ci_ly3(agg_supp$agg_ly[2],    agg_supp$agg_ly_lo[2], agg_supp$agg_ly_hi[2])),
+  `p (Pre vs Post)` = c("", "", "", "", "", "", "",
+                        fmt_pv3(p_wl_supp),
+                        fmt_pv3(p_surv_wl_supp),
+                        fmt_pv3(p_rc_supp),
+                        fmt_pv3(p_surv_rc_supp),
+                        fmt_pv3(p_avg_supp),
+                        fmt_pv3(p_agg_supp),
+                        fmt_pv3(p_agg_supp))
+)
+
+knitr::kable(supp_table, align = "lrrr",
+             caption = "Supplemental 2-year aggregate benefit on the restricted 10-month listing windows (Aug 2019–May 2020 vs Aug 2022–May 2023), tau = 730 days.")
+```
+
+## Donor-Type Subgroup (DBD)
+
+```{r sensitivity_donor_type, dependson="load_cohorts"}
+# Donor type sensitivity: replicate matched-cohort analysis for DBD
+# donors, using DON_NON_HR_BEAT from donor_deceased.sas7bdat.
+# Pre vs Post Student's t-test computed within DBD donors.
+
+data_path <- "/Users/danieljohnson/Library/CloudStorage/Box-Box/Q1 2026 SAF/pubsaf2603/"
+
+donor_nhb <- read_sas(paste0(data_path, "donor_deceased.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels() %>%
+  select(DONOR_ID, DON_NON_HR_BEAT)
+
+px_donor_type <- read_sas(paste0(data_path, "tx_ki.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels() %>%
+  arrange(PX_ID, REC_TX_DT) %>%
+  group_by(PX_ID) %>% slice(1) %>% ungroup() %>%
+  select(PX_ID, DONOR_ID) %>%
+  left_join(donor_nhb, by = "DONOR_ID") %>%
+  mutate(donor_dcd = case_when(
+    DON_NON_HR_BEAT %in% c("Y", "1", 1) ~ "DCD",
+    DON_NON_HR_BEAT %in% c("N", "0", 0) ~ "DBD",
+    TRUE                                ~ NA_character_
+  )) %>%
+  select(PX_ID, donor_dcd)
+
+run_donor_subset <- function(cohort_data, donor_label, tau = 365) {
+  sub <- cohort_data %>%
+    left_join(px_donor_type, by = "PX_ID") %>%
+    filter(transplanted == 0 | donor_dcd == donor_label)
+  n_tx <- sum(sub$transplanted == 1)
+  n_elig    <- nrow(sub)
+  n_elig_wl <- sum(sub$transplanted == 0)
+  if (n_tx < 10 || n_elig_wl < 10) {
+    return(list(sufficient = FALSE,
+                n_elig = n_elig, n_elig_rec = n_tx, n_elig_wl = n_elig_wl,
+                n_matched = 0L, n_match_r = 0L, n_match_w = 0L))
+  }
+  set.seed(20210930)
+  m_d <- tryCatch(
+    matchit(
+      transplanted ~ blood_type + age + region + list_day + on_dialysis + dialysis_days + diag,
+      data = sub, method = "nearest", distance = "glm", link = "probit",
+      mahvars = ~ age + list_day + on_dialysis + dialysis_days, ratio = 1, replace = FALSE
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(m_d)) {
+    return(list(sufficient = FALSE,
+                n_elig = n_elig, n_elig_rec = n_tx, n_elig_wl = n_elig_wl,
+                n_matched = 0L, n_match_r = 0L, n_match_w = 0L))
+  }
+  matched_d <- match.data(m_d)
+  res <- get_rmst_res(matched_d, n_tx, tau)
+  res$sufficient  <- TRUE
+  res$n_elig      <- n_elig
+  res$n_elig_rec  <- n_tx
+  res$n_elig_wl   <- n_elig_wl
+  res$n_match_r   <- sum(matched_d$transplanted == 1)
+  res$n_match_w   <- sum(matched_d$transplanted == 0)
+  res$matched_d   <- matched_d
+  res
+}
+
+# Build the per-donor column triplet (Pre, Post, p) as 12-element vectors:
+# 7 N rows + 5 outcome rows. N rows are always computable. Outcome rows fall
+# back to em-dashes when matching had insufficient data in either period.
+build_donor_col <- function(pre, post, n_tx_pre, n_tx_post) {
+  n_rows_pre <- c(comma(pre$n_elig),    comma(pre$n_elig_rec), comma(pre$n_elig_wl),
+                  comma(pre$n_matched), comma(pre$n_match_r),  comma(pre$n_match_w),
+                  comma(n_tx_pre))
+  n_rows_post <- c(comma(post$n_elig),   comma(post$n_elig_rec), comma(post$n_elig_wl),
+                   comma(post$n_matched), comma(post$n_match_r), comma(post$n_match_w),
+                   comma(n_tx_post))
+  # N-row p-values blanked (counts not formally tested here).
+  n_rows_p <- rep("", 7)
+
+  if (!isTRUE(pre$sufficient) || !isTRUE(post$sufficient)) {
+    out_pre  <- c("\u2014", "\u2014", "\u2014", "\u2014", "insufficient", "\u2014", "\u2014")
+    out_post <- c("\u2014", "\u2014", "\u2014", "\u2014", "insufficient", "\u2014", "\u2014")
+    out_p    <- c("", "", "", "", "", "", "")
+  } else {
+    cmp <- cmp_pre_post(pre, post)
+    # Log-rank for 1-year survival (replaces the t-test on KM-derived
+    # survival estimates within cmp$p_surv_wl / cmp$p_surv_rc).
+    p_surv_wl_lr <- logrank_p_prepost(pre$matched_d  %>% filter(transplanted == 0),
+                                      post$matched_d %>% filter(transplanted == 0))
+    p_surv_rc_lr <- logrank_p_prepost(pre$matched_d  %>% filter(transplanted == 1),
+                                      post$matched_d %>% filter(transplanted == 1))
+    out_pre <- c(ci_d(pre$wl),  ci_surv(pre$surv_wl),
+                 ci_d(pre$rc),  ci_surv(pre$surv_rc),
+                 ci_dpos(pre$diff),
+                 ci_agg(pre$n_tx, pre$diff),  ci_ly(pre$n_tx, pre$diff))
+    out_post <- c(ci_d(post$wl), ci_surv(post$surv_wl),
+                  ci_d(post$rc), ci_surv(post$surv_rc),
+                  ci_dpos(post$diff),
+                  ci_agg(post$n_tx, post$diff), ci_ly(post$n_tx, post$diff))
+    out_p   <- c(fmt_p(cmp$p_wl),      fmt_p(p_surv_wl_lr),
+                 fmt_p(cmp$p_rc),      fmt_p(p_surv_rc_lr),
+                 fmt_p(cmp$p_avg),
+                 fmt_p(cmp$p_agg),     fmt_p(cmp$p_agg))
+  }
+  list(
+    pre  = c(n_rows_pre,  out_pre),
+    post = c(n_rows_post, out_post),
+    p    = c(n_rows_p,    out_p)
+  )
+}
+
+# Donor-specific total N transplants in the cohort listing window (analytic
+# count, before NA-on-covariate eligibility filters), parallel to the
+# "N transplants" row in agg_table.
+analytic_donor <- cohort_combined %>% left_join(px_donor_type, by = "PX_ID")
+n_tx_dbd1 <- sum(analytic_donor$transplanted == 1 & analytic_donor$cohort == "Pre-Policy" &
+                 analytic_donor$donor_dcd == "DBD" & !is.na(analytic_donor$donor_dcd))
+n_tx_dbd2 <- sum(analytic_donor$transplanted == 1 & analytic_donor$cohort == "Post-Policy" &
+                 analytic_donor$donor_dcd == "DBD" & !is.na(analytic_donor$donor_dcd))
+
+res_pre_dbd  <- run_donor_subset(cohort1, "DBD")
+res_post_dbd <- run_donor_subset(cohort2, "DBD")
+
+dbd_cols <- build_donor_col(res_pre_dbd, res_post_dbd, n_tx_dbd1, n_tx_dbd2)
+
+donor_table <- tibble(
+  ` ` = c("N eligible candidates",
+          "N eligible recipients",
+          "N eligible waitlisted",
+          "N matched candidates",
+          "N matched recipients",
+          "N matched waitlisted",
+          "N transplants",
+          "Waitlist RMST (days)", "1-year survival, waitlisted (%)",
+          "Recipient RMST (days)", "1-year survival, recipients (%)",
+          "Avg benefit per tx (days)", "Aggregate benefit (days)",
+          "Aggregate benefit (life-years)"),
+  `DBD Pre`  = dbd_cols$pre,
+  `DBD Post` = dbd_cols$post,
+  `DBD p`    = dbd_cols$p
+)
+
+knitr::kable(
+  donor_table,
+  caption = paste("Donor-type sensitivity analysis (kidney):",
+                  "matched-cohort RMST for DBD (donation after brain death) donors",
+                  "(DON_NON_HR_BEAT from donor_deceased.sas7bdat), tau = 365 days.",
+                  "Values are point estimate (95% CI); p-values: Student's",
+                  "t-test comparing Pre-Policy vs Post-Policy within DBD donors.")
+)
+```

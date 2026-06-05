@@ -1,0 +1,246 @@
+---
+title: "Combined Survival Benefit by Organ — Aug 2022 Policy Implementation"
+output: html_document
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      cache = TRUE, cache.comments = FALSE)
+Sys.setenv(RSTUDIO_PANDOC =
+  '/Applications/Positron.app/Contents/Resources/app/quarto/bin/tools/aarch64')
+```
+
+```{r packages, cache=FALSE}
+library(tidyverse)
+library(haven)
+library(survRM2)
+library(scales)
+```
+
+```{r setup}
+# Shared cohort dates (all _2022 organs; informational)
+c1_start <- as.Date("2019-08-01")
+c1_end   <- as.Date("2021-07-31")
+c2_start <- as.Date("2022-08-01")
+c2_end   <- as.Date("2024-07-31")
+
+# Use the SAME inputs as survival_benefit_<organ>_2022.Rmd so the combined
+# figures agree with each per-organ report:
+#   * Per-capita 1-year RMSTs (waitlist, recipient, benefit) are computed on the
+#     1:1 propensity-score MATCHED cohorts (matched_<organ>.rds).
+#   * Aggregate benefit scales the matched per-capita benefit by the number
+#     transplanted in the ELIGIBLE cohort (cohort_<organ>.rds), i.e.
+#     n_tx <- sum(cohort$transplanted), exactly as each organ file does.
+# Both RDS sets are rebuilt by data_prep.Rmd and carry a `cohort` column with
+# values "Pre-Policy" / "Post-Policy".
+organs <- c(Heart = "heart", Kidney = "kidney", Liver = "liver", Lung = "lung")
+
+organ_matched  <- lapply(organs, function(o) readRDS(paste0("matched_", o, ".rds")))
+organ_eligible <- lapply(organs, function(o) readRDS(paste0("cohort_",  o, ".rds")))
+
+cohort_vals <- c("Pre-Policy" = "#374E55", "Post-Policy" = "#DF8F44")
+```
+
+```{r prep_data, dependson="setup"}
+organ_names  <- names(organ_matched)
+organ_levels <- c("Heart", "Kidney", "Liver", "Lung")
+
+# Per-capita 1-year RMST on the matched cohort for one organ + policy period.
+# Returns the rmst2() object, or NULL if an arm is too small / rmst2() fails
+# (same >=10-per-arm guard the organ files rely on).
+matched_rmst <- function(org, coh) {
+  m <- organ_matched[[org]] %>% filter(cohort == coh, follow_days_1y > 0)
+  if (sum(m$transplanted) < 10 || sum(m$transplanted == 0) < 10) return(NULL)
+  tryCatch(rmst2(m$follow_days_1y, m$dead_1y, m$transplanted, tau = 365),
+           error = function(e) NULL)
+}
+
+# Number transplanted in the ELIGIBLE cohort — the aggregate-benefit multiplier
+# (matches n_tx <- sum(cohort1$transplanted) in the organ files).
+elig_n_tx <- function(org, coh) {
+  e <- organ_eligible[[org]]
+  sum(e$transplanted[e$cohort == coh])
+}
+
+as_organ_factors <- function(df) {
+  df %>% mutate(
+    organ  = factor(organ,  levels = organ_levels),
+    cohort = factor(cohort, levels = c("Pre-Policy", "Post-Policy"))
+  )
+}
+```
+
+```{r tx_count_bar, dependson="prep_data", fig.width=7, fig.height=4}
+# Number of transplants among ELIGIBLE candidates listed in each window —
+# sum(transplanted) in cohort_<organ>.rds. This is the same n_tx that scales the
+# aggregate benefit below and that each organ file reports, so the bars are
+# consistent across all three views (count, per-capita benefit, aggregate).
+tx_count_forest <- bind_rows(lapply(organ_names, function(org) {
+  tibble(organ  = org,
+         cohort = c("Pre-Policy", "Post-Policy"),
+         est    = c(elig_n_tx(org, "Pre-Policy"), elig_n_tx(org, "Post-Policy")))
+})) %>%
+  as_organ_factors()
+
+ggplot(tx_count_forest, aes(x = organ, y = est, fill = cohort,
+                            group = interaction(organ, cohort))) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_fill_manual(values = cohort_vals, name = NULL) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Number of Transplants") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        legend.position = "bottom")
+```
+
+```{r waitlist_bar, dependson="prep_data", fig.width=7, fig.height=4}
+# 1-year waitlist RMST (arm=0, never-transplanted) by organ and cohort,
+# from the matched cohorts.
+waitlist_forest <- bind_rows(lapply(organ_names, function(org) {
+  bind_rows(lapply(c("Pre-Policy", "Post-Policy"), function(coh) {
+    r <- matched_rmst(org, coh); if (is.null(r)) return(NULL)
+    wl <- r$RMST.arm0$rmst
+    tibble(organ = org, cohort = coh,
+           est = unname(wl["Est."]),
+           lo  = unname(wl["lower .95"]),
+           hi  = unname(wl["upper .95"]))
+  }))
+})) %>%
+  as_organ_factors()
+
+ggplot(waitlist_forest, aes(x = organ, y = est, fill = cohort,
+                            group = interaction(organ, cohort))) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                position = position_dodge(width = 0.8),
+                width = 0.2, lwd = 0.5, color = "gray30") +
+  scale_fill_manual(values = cohort_vals, name = NULL) +
+  labs(x = NULL, y = "1-year RMST (days)") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        legend.position = "bottom")
+```
+
+```{r recipient_bar, dependson="prep_data", fig.width=7, fig.height=4}
+# 1-year post-transplant RMST (arm=1, recipients) by organ and cohort,
+# from the matched cohorts.
+recipient_forest <- bind_rows(lapply(organ_names, function(org) {
+  bind_rows(lapply(c("Pre-Policy", "Post-Policy"), function(coh) {
+    r <- matched_rmst(org, coh); if (is.null(r)) return(NULL)
+    rc <- r$RMST.arm1$rmst
+    tibble(organ = org, cohort = coh,
+           est = unname(rc["Est."]),
+           lo  = unname(rc["lower .95"]),
+           hi  = unname(rc["upper .95"]))
+  }))
+})) %>%
+  as_organ_factors()
+
+ggplot(recipient_forest, aes(x = organ, y = est, fill = cohort,
+                            group = interaction(organ, cohort))) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                position = position_dodge(width = 0.8),
+                width = 0.2, lwd = 0.5, color = "gray30") +
+  scale_fill_manual(values = cohort_vals, name = NULL) +
+  labs(x = NULL, y = "1-year RMST (days)") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        legend.position = "bottom")
+```
+
+```{r benefit_bar, dependson="prep_data", fig.width=7, fig.height=4}
+# Average (per-capita) 1-year survival benefit = RMST(arm=1) - RMST(arm=0)
+# on the matched cohorts.
+benefit_forest <- bind_rows(lapply(organ_names, function(org) {
+  bind_rows(lapply(c("Pre-Policy", "Post-Policy"), function(coh) {
+    r <- matched_rmst(org, coh); if (is.null(r)) return(NULL)
+    drow <- r$unadjusted.result["RMST (arm=1)-(arm=0)", ]
+    tibble(organ = org, cohort = coh,
+           est = unname(drow["Est."]),
+           lo  = unname(drow["lower .95"]),
+           hi  = unname(drow["upper .95"]))
+  }))
+})) %>%
+  as_organ_factors()
+
+ggplot(benefit_forest, aes(x = organ, y = est, fill = cohort,
+                            group = interaction(organ, cohort))) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                position = position_dodge(width = 0.8),
+                width = 0.2, lwd = 0.5, color = "gray30") +
+  scale_fill_manual(values = cohort_vals, name = NULL) +
+  labs(x = NULL, y = "Average survival benefit (days)") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        legend.position = "bottom")
+```
+
+```{r aggregate_bar, dependson="prep_data", fig.width=7, fig.height=4}
+# Aggregate 1-year survival benefit (days) = matched per-capita benefit x the
+# number transplanted in the eligible cohort, matching each organ file's
+# agg_days <- n_tx * benefit (n_tx <- sum(cohort$transplanted)).
+agg_forest <- bind_rows(lapply(organ_names, function(org) {
+  bind_rows(lapply(c("Pre-Policy", "Post-Policy"), function(coh) {
+    r <- matched_rmst(org, coh); if (is.null(r)) return(NULL)
+    drow <- r$unadjusted.result["RMST (arm=1)-(arm=0)", ]
+    n_tx <- elig_n_tx(org, coh)
+    tibble(organ = org, cohort = coh,
+           est = unname(n_tx * drow["Est."]),
+           lo  = unname(n_tx * drow["lower .95"]),
+           hi  = unname(n_tx * drow["upper .95"]))
+  }))
+})) %>%
+  as_organ_factors()
+
+ggplot(agg_forest, aes(x = organ, y = est, fill = cohort,
+                            group = interaction(organ, cohort))) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                position = position_dodge(width = 0.8),
+                width = 0.2, lwd = 0.5, color = "gray30") +
+  scale_fill_manual(values = cohort_vals, name = NULL) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Aggregate survival benefit (days)") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        legend.position = "bottom")
+```
+
+```{r aggregate_bar_years, dependson="aggregate_bar", fig.width=7, fig.height=4}
+# Aggregate survival benefit in life-years (days / 365.25).
+agg_forest_years <- agg_forest %>%
+  mutate(est = est / 365.25, lo = lo / 365.25, hi = hi / 365.25)
+
+ggplot(agg_forest_years, aes(x = organ, y = est, fill = cohort,
+                              group = interaction(organ, cohort))) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                position = position_dodge(width = 0.8),
+                width = 0.2, lwd = 0.5, color = "gray30") +
+  scale_fill_manual(values = cohort_vals, name = NULL) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Aggregate survival benefit (life-years)") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        legend.position = "bottom")
+```
