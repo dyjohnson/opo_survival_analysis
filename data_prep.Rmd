@@ -119,21 +119,26 @@ remove(institution, hist_opo_txc, opo_tiers)
 #       kidney in cand_kipa).
 multi_organ_codes <- c("HL", "KP")
 
+# Keyed on PERS_ID (per-person), not PX_ID (per-registration): a candidate
+# listed for different organs holds a separate registration -- and a separate
+# PX_ID -- for each, so grouping by PX_ID could never see more than one WL_ORG
+# per group and clause (b) never fired. PERS_ID collapses a person's separate
+# registrations, so cross-registration multi-organ listing is now detected.
 multi_organ_listings <- bind_rows(
-  cand_thor %>% select(PX_ID, WL_ORG),
-  cand_liin %>% select(PX_ID, WL_ORG),
-  cand_kipa %>% select(PX_ID, WL_ORG)
+  cand_thor %>% select(PERS_ID, WL_ORG),
+  cand_liin %>% select(PERS_ID, WL_ORG),
+  cand_kipa %>% select(PERS_ID, WL_ORG)
 ) %>%
   filter(!is.na(WL_ORG)) %>%
-  distinct(PX_ID, WL_ORG) %>%
-  group_by(PX_ID) %>%
+  distinct(PERS_ID, WL_ORG) %>%
+  group_by(PERS_ID) %>%
   summarise(n_organ        = n_distinct(WL_ORG),
             any_multi_code = any(WL_ORG %in% multi_organ_codes),
             .groups        = "drop")
 
 multi_organ_ids <- multi_organ_listings %>%
   filter(n_organ > 1 | any_multi_code) %>%
-  pull(PX_ID)
+  pull(PERS_ID)
 
 cat(sprintf(paste0("Multi-organ candidates (>1 distinct WL_ORG listing ",
                     "or WL_ORG in {%s}): %s\n"),
@@ -320,11 +325,11 @@ analytic_heart <- cand_thor %>%
     data_error          = as.integer((!is.na(bmi) & (bmi > 100 | bmi < 10)) |
                                        (!is.na(follow_days_1y) & follow_days_1y < 0) |
                                        init_status %in% c("2010", "2020")),
-    is_multi_organ      = as.integer(PX_ID %in% multi_organ_ids)
+    is_multi_organ      = as.integer(PERS_ID %in% multi_organ_ids)
   ) %>%
   filter(in_cohort_1 | in_cohort_2) %>%
   select(
-    PX_ID, list_date, transplanted,
+    PERS_ID, PX_ID, list_date, transplanted,
     in_cohort_1, in_cohort_2,
     tx_date, second_tx_date, admin_censor, death_date,
     blood_type, age, region, list_day,
@@ -445,11 +450,11 @@ analytic_liver <- cand_liin %>%
     inactive_throughout = as.integer(is.na(init_act_dt) & !is.na(init_inact_dt)),
     data_error          = as.integer((!is.na(bmi) & (bmi > 100 | bmi < 10)) |
                                        (!is.na(follow_days_1y) & follow_days_1y < 0)),
-    is_multi_organ      = as.integer(PX_ID %in% multi_organ_ids)
+    is_multi_organ      = as.integer(PERS_ID %in% multi_organ_ids)
   ) %>%
   filter(in_cohort_1 | in_cohort_2) %>%
   select(
-    PX_ID, list_date, transplanted,
+    PERS_ID, PX_ID, list_date, transplanted,
     in_cohort_1, in_cohort_2,
     tx_date, second_tx_date, admin_censor, death_date,
     blood_type, age, region, list_day,
@@ -572,11 +577,11 @@ analytic_lung <- cand_thor %>%
     inactive_throughout = as.integer(is.na(init_act_dt) & !is.na(init_inact_dt)),
     data_error          = as.integer((!is.na(bmi) & (bmi > 100 | bmi < 10)) |
                                        (!is.na(follow_days_1y) & follow_days_1y < 0)),
-    is_multi_organ      = as.integer(PX_ID %in% multi_organ_ids)
+    is_multi_organ      = as.integer(PERS_ID %in% multi_organ_ids)
   ) %>%
   filter(in_cohort_1 | in_cohort_2) %>%
   select(
-    PX_ID, list_date, transplanted,
+    PERS_ID, PX_ID, list_date, transplanted,
     in_cohort_1, in_cohort_2,
     tx_date, second_tx_date, admin_censor, death_date,
     blood_type, age, region, list_day,
@@ -705,11 +710,11 @@ analytic_kidney <- cand_kipa %>%
     inactive_throughout = as.integer(is.na(init_act_dt) & !is.na(init_inact_dt)),
     data_error          = as.integer((!is.na(bmi) & (bmi > 100 | bmi < 10)) |
                                        (!is.na(follow_days_1y) & follow_days_1y < 0)),
-    is_multi_organ      = as.integer(PX_ID %in% multi_organ_ids)
+    is_multi_organ      = as.integer(PERS_ID %in% multi_organ_ids)
   ) %>%
   filter(in_cohort_1 | in_cohort_2) %>%
   select(
-    PX_ID, list_date, transplanted,
+    PERS_ID, PX_ID, list_date, transplanted,
     in_cohort_1, in_cohort_2,
     tx_date, second_tx_date, admin_censor, death_date,
     blood_type, age, region, list_day,
@@ -734,40 +739,66 @@ analytic_list <- list(Heart  = analytic_heart,
                       Lung   = analytic_lung,
                       Kidney = analytic_kidney)
 
+# Collapse multiple listings to one row per person before applying exclusions.
+# SRTR PX_ID is per-registration: a candidate listed for the same organ at more
+# than one center holds several PX_IDs sharing one PERS_ID. Without this, each
+# registration is counted as an independent candidate, and -- because a
+# transplant links to only the registration under which it occurred -- a
+# multiply-listed recipient would appear as transplanted=1 on that registration
+# and transplanted=0 (a waitlisted control) on the others, i.e. the same person
+# in both arms. Keep the transplanted registration if any, then an active
+# listing over a never-active one, then the earliest listing.
+dedupe_persons <- function(d) {
+  d %>%
+    arrange(desc(transplanted), inactive_throughout, list_date) %>%
+    group_by(PERS_ID) %>%
+    slice(1) %>%
+    ungroup()
+}
+
 apply_global <- function(d) {
   step0 <- d
-  step1 <- step0 %>% filter(is_multi_organ      == 0)
-  step2 <- step1 %>% filter(inactive_throughout == 0)
-  step3 <- step2 %>% filter(data_error          == 0)
+  step_d <- dedupe_persons(step0)
+  step1 <- step_d %>% filter(is_multi_organ      == 0)
+  step2 <- step1  %>% filter(inactive_throughout == 0)
+  step3 <- step2  %>% filter(data_error          == 0)
   list(
-    step0 = step0, step1 = step1, step2 = step2, step3 = step3,
-    n_listed = nrow(step0),
-    n_multi  = nrow(step0) - nrow(step1),
-    n_inact  = nrow(step1) - nrow(step2),
-    n_derr   = nrow(step2) - nrow(step3),
-    n_after  = nrow(step3)
+    step0 = step0, step_d = step_d, step1 = step1, step2 = step2, step3 = step3,
+    n_listed  = nrow(step0),
+    n_persons = n_distinct(step0$PERS_ID),
+    n_dupe    = nrow(step0) - nrow(step_d),
+    n_multi   = nrow(step_d) - nrow(step1),
+    n_inact   = nrow(step1) - nrow(step2),
+    n_derr    = nrow(step2) - nrow(step3),
+    n_after   = nrow(step3)
   )
 }
 global_results <- lapply(analytic_list, apply_global)
 
 cat("Global exclusions (applied to each organ's analytic frame):\n\n")
-totals <- c(listed = 0, multi = 0, inact = 0, derr = 0, after = 0)
+totals <- c(listed = 0, persons = 0, dupe = 0, multi = 0, inact = 0, derr = 0, after = 0)
 for (org in names(global_results)) {
   g <- global_results[[org]]
   cat(sprintf("  %s\n", org))
-  cat(sprintf("    Listed in Pre or Post window:              %s\n", comma(g$n_listed)))
+  cat(sprintf("    Registrations in Pre or Post window:       %s\n", comma(g$n_listed)))
+  cat(sprintf("      (distinct candidates:                    %s)\n", comma(g$n_persons)))
+  cat(sprintf("      - Duplicate multi-center listings:       -%s\n", comma(g$n_dupe)))
   cat(sprintf("      - Multi-organ candidate/recipient:       -%s\n", comma(g$n_multi)))
   cat(sprintf("      - Inactive at listing & never active:    -%s\n", comma(g$n_inact)))
   cat(sprintf("      - Data entry errors:                     -%s\n", comma(g$n_derr)))
   cat(sprintf("    After global exclusions:                   %s\n\n", comma(g$n_after)))
-  totals["listed"] <- totals["listed"] + g$n_listed
-  totals["multi"]  <- totals["multi"]  + g$n_multi
-  totals["inact"]  <- totals["inact"]  + g$n_inact
-  totals["derr"]   <- totals["derr"]   + g$n_derr
-  totals["after"]  <- totals["after"]  + g$n_after
+  totals["listed"]  <- totals["listed"]  + g$n_listed
+  totals["persons"] <- totals["persons"] + g$n_persons
+  totals["dupe"]    <- totals["dupe"]    + g$n_dupe
+  totals["multi"]   <- totals["multi"]   + g$n_multi
+  totals["inact"]   <- totals["inact"]   + g$n_inact
+  totals["derr"]    <- totals["derr"]    + g$n_derr
+  totals["after"]   <- totals["after"]   + g$n_after
 }
 cat(sprintf("  TOTAL across organs\n"))
-cat(sprintf("    Listed in Pre or Post window:              %s\n", comma(totals["listed"])))
+cat(sprintf("    Registrations in Pre or Post window:       %s\n", comma(totals["listed"])))
+cat(sprintf("      (distinct candidates:                    %s)\n", comma(totals["persons"])))
+cat(sprintf("      - Duplicate multi-center listings:       -%s\n", comma(totals["dupe"])))
 cat(sprintf("      - Multi-organ candidate/recipient:       -%s\n", comma(totals["multi"])))
 cat(sprintf("      - Inactive at listing & never active:    -%s\n", comma(totals["inact"])))
 cat(sprintf("      - Data entry errors:                     -%s\n", comma(totals["derr"])))
