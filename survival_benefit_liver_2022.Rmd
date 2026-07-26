@@ -8,7 +8,7 @@ knit: (function(input, ...) rmarkdown::render(input, output_dir = file.path(dirn
 
 ```{r global_options, include=FALSE}
 library(knitr)
-opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE,
+opts_chunk$set(cache = TRUE, cache.lazy = FALSE, warning = FALSE, message = FALSE,
                tidy.opts = list(width.cutoff = 60))
 ```
 
@@ -62,7 +62,7 @@ plot_km <- function(kdf, title = "", tau = 365,
     geom_step(aes(y = upper), linetype = "dashed", linewidth = 0.35) +
     scale_x_continuous(limits = c(0, tau / 30.44), breaks = 0:12,
                        expand = expansion(mult = c(0, 0.02))) +
-    scale_y_continuous(limits = c(0, 1),
+    scale_y_continuous(limits = c(0.45, 1),
                        labels = scales::percent_format(accuracy = 1),
                        expand = expansion(mult = c(0, 0.02))) +
     scale_color_manual(values = colors) +
@@ -397,9 +397,16 @@ ci_pct      <- function(est, lo, hi)
 ci_pct_diff <- function(est, lo, hi)
   sprintf("%+.1f%% (%+.1f%%, %+.1f%%)", 100 * est, 100 * lo, 100 * hi)
 
+# Eligible recipients per year: divide the eligible-recipient count by the
+# cohort window length (~2 years), matching the as.numeric(end - start) / 365.25
+# convention used elsewhere (data_prep low-volume thresholds, supp analyses).
+elig_rec_py1 <- n1 / (as.numeric(c1_end - c1_start) / 365.25)
+elig_rec_py2 <- n2 / (as.numeric(c2_end - c2_start) / 365.25)
+
 agg_table <- tibble(
   ` ` = c("N eligible candidates",
           "N eligible recipients",
+          "N eligible recipients per year",
           "N eligible waitlisted",
           "N matched candidates",
           "N matched recipients",
@@ -414,6 +421,7 @@ agg_table <- tibble(
           "Aggregate benefit (life-years)"),
   `Pre-Policy` = c(comma(n_elig1),
                    comma(n1),
+                   comma(round(elig_rec_py1)),
                    comma(n_wl1),
                    comma(n_match1),
                    comma(n_match_r1),
@@ -428,6 +436,7 @@ agg_table <- tibble(
                    ci_ly(agg$agg_ly[1],    agg$agg_ly_lo[1], agg$agg_ly_hi[1])),
   `Post-Policy` = c(comma(n_elig2),
                     comma(n2),
+                    comma(round(elig_rec_py2)),
                     comma(n_wl2),
                     comma(n_match2),
                     comma(n_match_r2),
@@ -442,6 +451,7 @@ agg_table <- tibble(
                     ci_ly(agg$agg_ly[2],    agg$agg_ly_lo[2], agg$agg_ly_hi[2])),
   `Difference (95% CI)` = c(diff_count(n_elig1,    n_elig2),
                             diff_count(n1,         n2),
+                            diff_count(round(elig_rec_py1), round(elig_rec_py2)),
                             diff_count(n_wl1,      n_wl2),
                             diff_count(n_match1,   n_match2),
                             diff_count(n_match_r1, n_match_r2),
@@ -460,7 +470,7 @@ agg_table <- tibble(
                             diff_se(agg$agg_ly[1],   agg$agg_ly[2],
                                     n1 * se_d1 / 365.25, n2 * se_d2 / 365.25,
                                     ci_ly_signed)),
-  `p (Pre vs Post)` = c("", "", "", "", "", "", "",
+  `p (Pre vs Post)` = c("", "", "", "", "", "", "", "",
                         fmt_pv(p_wl),
                         fmt_pv(p_surv_wl),
                         fmt_pv(p_rc),
@@ -608,16 +618,16 @@ p_km <- ggplot(kdf_overlay,
   scale_x_continuous(limits = c(0, 365 / 30.44), breaks = 0:12,
                      expand = x_expand) +
   scale_y_continuous(labels = function(x) sprintf("%.2f", x),
-                     breaks = seq(0.6, 1, 0.1),
+                     breaks = seq(0.5, 1, 0.1),
                      expand = expansion(mult = c(0, 0.02))) +
-  coord_cartesian(ylim = c(0.55, 1)) +
+  coord_cartesian(ylim = c(0.45, 1)) +
   scale_color_manual(values = combo_colors, name = NULL) +
   scale_linetype_manual(values = combo_lty, name = NULL) +
   guides(color    = guide_legend(nrow = 2, byrow = TRUE),
          linetype = guide_legend(nrow = 2, byrow = TRUE)) +
-  annotate("text", x = 0.5, y = 0.62, label = lab_lr_tx,
+  annotate("text", x = 0.5, y = 0.51, label = lab_lr_tx,
            hjust = 0, vjust = 0, size = 4.5) +
-  annotate("text", x = 0.5, y = 0.58, label = lab_lr_wl,
+  annotate("text", x = 0.5, y = 0.47, label = lab_lr_wl,
            hjust = 0, vjust = 0, size = 4.5) +
   labs(x = "Time, mo", y = "Survival probability") +
   theme_bw(base_size = 12) +
@@ -645,6 +655,57 @@ p_risk <- ggplot(risk_df,
 
 overlay_zoom <- p_km / p_risk + plot_layout(heights = c(3, 1))
 overlay_zoom
+```
+
+# Quarterly RMST Over the Study Period
+
+```{r quarterly_rmst, dependson="load_cohorts", fig.width=9, fig.height=5.5}
+# Quarterly 1-year RMST of matched waitlisted candidates (arm 0) and matched
+# transplant recipients (arm 1), binned by the calendar quarter of listing
+# across the study period. Within each (cohort, quarter) cell, per-arm 1-year
+# RMSTs (tau = 365) and their 95% CIs come from rmst2() on that quarter's
+# matched candidates. Cells with < 10 candidates in either arm are dropped.
+# The Pre- and Post-Policy windows are drawn as separate segments; the
+# intervening year contains no listings by cohort definition.
+quarterly_rmst <- matched_combined %>%
+  filter(follow_days_1y > 0) %>%
+  mutate(qtr = lubridate::floor_date(list_date, "quarter")) %>%
+  group_by(cohort, qtr) %>%
+  group_modify(~{
+    d <- .x
+    if (sum(d$transplanted == 1) < 10 || sum(d$transplanted == 0) < 10)
+      return(tibble())
+    r <- tryCatch(rmst2(d$follow_days_1y, d$dead_1y, d$transplanted, tau = 365),
+                  error = function(e) NULL)
+    if (is.null(r)) return(tibble())
+    a0 <- r$RMST.arm0$rmst; a1 <- r$RMST.arm1$rmst
+    tibble(
+      arm  = c("Transplant recipient", "Waitlisted"),
+      rmst = c(a1["Est."],      a0["Est."]),
+      lo   = c(a1["lower .95"], a0["lower .95"]),
+      hi   = c(a1["upper .95"], a0["upper .95"])
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(arm = factor(arm, levels = c("Transplant recipient", "Waitlisted")))
+
+qrmst_cols <- c("Transplant recipient" = "#2166ac", "Waitlisted" = "#d6604d")
+
+ggplot(quarterly_rmst, aes(qtr, rmst, color = arm, fill = arm,
+                           group = interaction(arm, cohort))) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = qrmst_cols, name = NULL) +
+  scale_fill_manual(values = qrmst_cols, name = NULL) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(x = NULL, y = "1-year RMST (days)",
+       title = "Quarterly 1-year RMST by listing quarter",
+       subtitle = "Matched waitlisted candidates vs. transplant recipients") +
+  theme_bw(base_size = 12) +
+  theme(legend.position  = "bottom",
+        panel.grid.minor = element_blank(),
+        axis.text.x      = element_text(angle = 45, hjust = 1))
 ```
 
 ```{r cuminc_transplant, dependson="load_cohorts", fig.width=8, fig.height=5}
@@ -716,7 +777,7 @@ ggplot(ci_plot_df, aes(x = time / 30.44, y = cif,
   scale_x_continuous(limits = c(0, 365 / 30.44),
                      breaks = 0:12,
                      expand = expansion(mult = c(0, 0.02))) +
-  scale_y_continuous(limits = c(0, NA),
+  scale_y_continuous(limits = c(0, 1),
                      labels = function(x) sprintf("%.2f", x),
                      expand = expansion(mult = c(0, 0.02))) +
   scale_color_manual(values = ci_cohort_colors, name = NULL) +
@@ -1185,7 +1246,7 @@ ggplot(kdf1_supp, aes(x = time / 30.44, y = surv, color = group)) +
   geom_step(aes(y = upper), linetype = "dashed", linewidth = 0.35) +
   scale_x_continuous(limits = c(0, 730 / 30.44), breaks = seq(0, 24, 3),
                      expand = expansion(mult = c(0, 0.02))) +
-  scale_y_continuous(limits = c(0, 1),
+  scale_y_continuous(limits = c(0.45, 1),
                      labels = scales::percent_format(accuracy = 1),
                      expand = expansion(mult = c(0, 0.02))) +
   scale_color_manual(values = c("Transplant recipient" = "#2166ac",
@@ -1284,7 +1345,7 @@ ggplot(kdf2_supp, aes(x = time / 30.44, y = surv, color = group)) +
   geom_step(aes(y = upper), linetype = "dashed", linewidth = 0.35) +
   scale_x_continuous(limits = c(0, 730 / 30.44), breaks = seq(0, 24, 3),
                      expand = expansion(mult = c(0, 0.02))) +
-  scale_y_continuous(limits = c(0, 1),
+  scale_y_continuous(limits = c(0.45, 1),
                      labels = scales::percent_format(accuracy = 1),
                      expand = expansion(mult = c(0, 0.02))) +
   scale_color_manual(values = c("Transplant recipient" = "#2166ac",

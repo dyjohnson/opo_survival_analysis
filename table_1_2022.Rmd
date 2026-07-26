@@ -16,6 +16,7 @@ library(tidyverse)
 library(tableone)
 library(knitr)
 library(kableExtra)
+library(haven)
 ```
 
 ```{r load_cohorts}
@@ -113,6 +114,89 @@ cand_all <- bind_rows(lapply(organs, function(o) {
 
 cat("Eligible candidates by organ x cohort:\n")
 print(table(cand_all$organ, cand_all$cohort))
+```
+
+```{r donor_data}
+# Donor-level characteristics for the separate donor table (below). Donor
+# demographics and DCD status come from donor_deceased.sas7bdat. KDPI is not
+# distributed in this SAF, so each DECEASED donor's KDRI is computed from the
+# Rao et al. (2009) components and mapped to KDPI as the empirical percentile of
+# that KDRI among all deceased donors in the file. (Swap in the OPTN
+# year-specific scaling factor + KDPI mapping table here for the official KDPI.)
+# `kdri` is KDRI_Rao = exp(linear predictor), relative to the reference donor;
+# divide by the OPTN scaling factor for the median-scaled KDRI. Missing KDRI
+# components are set to reference values, per the OPTN convention. Living-donor
+# transplants have no deceased-donor record (living-donor data is not in this
+# SAF), so they are excluded from the donor table.
+data_path <- "/Users/danieljohnson/Library/CloudStorage/Box-Box/Q1 2026 SAF/pubsaf2603/"
+
+donor <- read_sas(paste0(data_path, "donor_deceased.sas7bdat"), NULL) %>%
+  zap_formats() %>% zap_labels() %>%
+  transmute(
+    DONOR_ID,
+    deceased   = TRUE,
+    don_age    = DON_AGE,
+    don_female = case_when(DON_GENDER == "F" ~ "Female",
+                           DON_GENDER == "M" ~ "Male",
+                           TRUE              ~ NA_character_),
+    don_abo    = case_when(DON_ABO %in% c("A", "A1", "A2")    ~ "A",
+                           DON_ABO %in% c("AB", "A1B", "A2B") ~ "AB",
+                           DON_ABO == "B"                     ~ "B",
+                           DON_ABO == "O"                     ~ "O",
+                           TRUE                               ~ NA_character_),
+    don_race_eth = case_when(DON_ETHNICITY_SRTR == "LATINO" ~ "Hispanic",
+                             DON_RACE_SRTR == "WHITE"        ~ "White",
+                             DON_RACE_SRTR == "BLACK"        ~ "Black",
+                             TRUE                            ~ "Other"),
+    dcd_status = case_when(DON_NON_HR_BEAT == "Y" ~ "Y",
+                           DON_NON_HR_BEAT == "N" ~ "N",
+                           TRUE                   ~ NA_character_),
+    # KDRI (Rao 2009) components
+    height = coalesce(DON_HGT_CM, 170),
+    weight = coalesce(DON_WGT_KG, 80),
+    black  = coalesce(as.integer(DON_RACE_SRTR == "BLACK"), 0L),
+    htn    = as.integer(DON_HIST_HYPERTEN %in% c(2, 3, 4, 5)),
+    diab   = as.integer(DON_HIST_DIAB     %in% c(2, 3, 4, 5)),
+    cva    = coalesce(as.integer(DON_CAD_DON_COD == 2), 0L),
+    creat  = pmin(coalesce(DON_CREAT, 1), 8),
+    hcv    = coalesce(as.integer(DON_ANTI_HCV == "P"), 0L),
+    dcd    = coalesce(as.integer(DON_NON_HR_BEAT == "Y"), 0L)
+  ) %>%
+  mutate(
+    kdri = exp(0.0128 * (don_age - 40) - 0.0194 * (don_age - 18) * (don_age < 18) +
+                 0.0107 * (don_age - 50) * (don_age > 50) -
+                 0.0464 * (height - 170) / 10 -
+                 0.0199 * (weight - 80) / 5 * (weight < 80) +
+                 0.1790 * black + 0.1260 * htn + 0.1300 * diab + 0.0881 * cva +
+                 0.2200 * (creat - 1) - 0.2090 * (creat - 1.5) * (creat > 1.5) +
+                 0.2400 * hcv + 0.1330 * dcd),
+    kdpi = 100 * ecdf(kdri[!is.na(kdri)])(kdri)
+  )
+
+# First transplant per PX_ID -> its donor, across the four organ tx files.
+px_donor <- bind_rows(lapply(c("tx_hr", "tx_li", "tx_lu", "tx_ki"), function(f) {
+  read_sas(paste0(data_path, f, ".sas7bdat"), NULL) %>%
+    zap_formats() %>% zap_labels() %>%
+    arrange(PX_ID, REC_TX_DT) %>% group_by(PX_ID) %>% slice(1) %>% ungroup() %>%
+    transmute(PX_ID, DONOR_ID)
+})) %>%
+  distinct(PX_ID, .keep_all = TRUE) %>%
+  left_join(donor %>% select(DONOR_ID, deceased, don_age, don_female, don_abo,
+                             don_race_eth, kdri, kdpi, dcd_status),
+            by = "DONOR_ID")
+
+# Donor-table analytic frame: one row per in-window transplant recipient with a
+# DECEASED donor, carrying the recipient's organ and cohort. Candidates
+# transplanted after admin censoring are controls here and are excluded.
+donor_df <- cand_all %>%
+  filter(transplanted == "Transplanted") %>%
+  select(PX_ID, organ, cohort) %>%
+  left_join(px_donor, by = "PX_ID") %>%
+  filter(!is.na(deceased))
+
+cat(sprintf("Deceased-donor recipients in donor table: %s (KDPI mean %.1f).\n",
+            format(nrow(donor_df), big.mark = ","),
+            mean(donor_df$kdpi, na.rm = TRUE)))
 ```
 
 ```{r table1}
@@ -348,6 +432,127 @@ kable(
     notation        = "none",
     threeparttable  = TRUE
   )
+```
+
+```{r donor_table}
+# Separate donor-characteristics table: donors of the deceased-donor transplant
+# recipients, with the same organ x cohort columns as table_1_2022.csv. Rows:
+# N, donor age, donor female sex, donor race/ethnicity, donor blood type, KDRI,
+# KDPI, and % DCD. Denominators are the deceased-donor recipients in each cell;
+# % DCD is among those with a known DCD status. Written to
+# donor_characteristics_2022.csv.
+ms_d  <- function(x) if (all(is.na(x))) "" else sprintf("%.1f (%.1f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+ms_d2 <- function(x) if (all(is.na(x))) "" else sprintf("%.2f (%.2f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+np_d  <- function(n, total) if (total == 0) "" else sprintf("%s (%.1f)", format(n, big.mark = ","), 100 * n / total)
+
+make_donor_col <- function(d) {
+  total       <- nrow(d)
+  n_dcd_known <- sum(!is.na(d$dcd_status))
+  c(
+    `N`                          = format(total, big.mark = ","),
+    `Age, mean (SD), years`      = ms_d(d$don_age),
+    `Female sex, No. (%)`        = np_d(sum(d$don_female == "Female", na.rm = TRUE), total),
+    `Race/ethnicity, No. (%)`    = "",
+    `  White`                    = np_d(sum(d$don_race_eth == "White",    na.rm = TRUE), total),
+    `  Black`                    = np_d(sum(d$don_race_eth == "Black",    na.rm = TRUE), total),
+    `  Hispanic`                 = np_d(sum(d$don_race_eth == "Hispanic", na.rm = TRUE), total),
+    `  Other`                    = np_d(sum(d$don_race_eth == "Other",    na.rm = TRUE), total),
+    `Blood type (ABO), No. (%)`  = "",
+    `  A`                        = np_d(sum(d$don_abo == "A",  na.rm = TRUE), total),
+    `  B`                        = np_d(sum(d$don_abo == "B",  na.rm = TRUE), total),
+    `  AB`                       = np_d(sum(d$don_abo == "AB", na.rm = TRUE), total),
+    `  O`                        = np_d(sum(d$don_abo == "O",  na.rm = TRUE), total),
+    `KDRI, mean (SD)`            = ms_d2(d$kdri),
+    `KDPI, mean (SD)`            = ms_d(d$kdpi),
+    `DCD donor, No. (%)`         = np_d(sum(d$dcd_status == "Y", na.rm = TRUE), n_dcd_known)
+  )
+}
+
+# Pre-vs-Post p-values within organ, among the deceased-donor recipients in each
+# cell. Continuous variables: two-sample t-test; categorical: Pearson chi-square.
+fmt_p_d  <- function(p) if (is.na(p)) "" else if (p < 0.001) "<0.001" else if (p < 0.01) sprintf("%.3f", p) else sprintf("%.2f", p)
+p_cont_d <- function(a, b) {
+  a <- a[!is.na(a)]; b <- b[!is.na(b)]
+  if (length(a) < 2 || length(b) < 2) return(NA_real_)
+  tryCatch(t.test(a, b, var.equal = TRUE)$p.value, error = function(e) NA_real_)
+}
+p_cat_d <- function(a, b) {
+  tab <- table(c(as.character(a), as.character(b)),
+               c(rep("pre", length(a)), rep("post", length(b))))
+  if (any(dim(tab) < 2)) return(NA_real_)
+  tryCatch(suppressWarnings(chisq.test(tab, correct = FALSE))$p.value, error = function(e) NA_real_)
+}
+
+make_donor_pval_col <- function(d_pre, d_post) {
+  c(
+    `N`                          = "",
+    `Age, mean (SD), years`      = fmt_p_d(p_cont_d(d_pre$don_age,      d_post$don_age)),
+    `Female sex, No. (%)`        = fmt_p_d(p_cat_d (d_pre$don_female,   d_post$don_female)),
+    `Race/ethnicity, No. (%)`    = fmt_p_d(p_cat_d (d_pre$don_race_eth, d_post$don_race_eth)),
+    `  White`                    = "",
+    `  Black`                    = "",
+    `  Hispanic`                 = "",
+    `  Other`                    = "",
+    `Blood type (ABO), No. (%)`  = fmt_p_d(p_cat_d (d_pre$don_abo,      d_post$don_abo)),
+    `  A`                        = "",
+    `  B`                        = "",
+    `  AB`                       = "",
+    `  O`                        = "",
+    `KDRI, mean (SD)`            = fmt_p_d(p_cont_d(d_pre$kdri,         d_post$kdri)),
+    `KDPI, mean (SD)`            = fmt_p_d(p_cont_d(d_pre$kdpi,         d_post$kdpi)),
+    `DCD donor, No. (%)`         = fmt_p_d(p_cat_d (d_pre$dcd_status,   d_post$dcd_status))
+  )
+}
+
+donor_keys <- list(
+  heart_pre  = c("Heart",  "Pre-Policy"),  heart_post = c("Heart",  "Post-Policy"),
+  lung_pre   = c("Lung",   "Pre-Policy"),  lung_post  = c("Lung",   "Post-Policy"),
+  liver_pre  = c("Liver",  "Pre-Policy"),  liver_post = c("Liver",  "Post-Policy"),
+  kidney_pre = c("Kidney", "Pre-Policy"),  kidney_post = c("Kidney", "Post-Policy")
+)
+donor_cols <- lapply(donor_keys, function(k)
+  make_donor_col(donor_df %>% filter(organ == k[1], cohort == k[2])))
+
+donor_row_labels     <- names(donor_cols[[1]])
+donor_section_labels <- c("Race/ethnicity, No. (%)", "Blood type (ABO), No. (%)")
+
+# Per-organ Pre-vs-Post p-value column, aligned row-for-row with the counts.
+donor_p <- lapply(c("Heart", "Lung", "Liver", "Kidney"), function(o)
+  make_donor_pval_col(donor_df %>% filter(organ == o, cohort == "Pre-Policy"),
+                      donor_df %>% filter(organ == o, cohort == "Post-Policy")))
+names(donor_p) <- c("heart_p", "lung_p", "liver_p", "kidney_p")
+stopifnot(all(vapply(donor_p, length, integer(1)) == length(donor_row_labels)))
+
+donor_table_df <- data.frame(
+  row_type   = ifelse(donor_row_labels %in% donor_section_labels, "section", "data"),
+  row_label  = donor_row_labels,
+  heart_pre  = donor_cols$heart_pre,  heart_post  = donor_cols$heart_post,  heart_p  = donor_p$heart_p,
+  lung_pre   = donor_cols$lung_pre,   lung_post   = donor_cols$lung_post,   lung_p   = donor_p$lung_p,
+  liver_pre  = donor_cols$liver_pre,  liver_post  = donor_cols$liver_post,  liver_p  = donor_p$liver_p,
+  kidney_pre = donor_cols$kidney_pre, kidney_post = donor_cols$kidney_post, kidney_p = donor_p$kidney_p,
+  row.names  = NULL, check.names = FALSE, stringsAsFactors = FALSE
+)
+
+write.csv(donor_table_df, "donor_characteristics_2022.csv", row.names = FALSE)
+
+kable(
+  donor_table_df %>% select(-row_type),
+  format    = "latex", booktabs = TRUE,
+  col.names = c(" ", "Heart Pre", "Heart Post", "Heart p",
+                "Lung Pre", "Lung Post", "Lung p",
+                "Liver Pre", "Liver Post", "Liver p",
+                "Kidney Pre", "Kidney Post", "Kidney p"),
+  caption   = paste("Donor characteristics among deceased-donor transplant",
+                    "recipients, by organ and cohort, with Pre-vs-Post p-values",
+                    "(t-test for continuous, chi-square for categorical). KDPI is",
+                    "reconstructed as the empirical percentile of the Rao (2009)",
+                    "KDRI among deceased donors; KDRI is the Rao KDRI (relative to",
+                    "the reference donor). Denominators are deceased-donor",
+                    "recipients; DCD percentage is among those with known DCD status."),
+  linesep   = ""
+) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down")) %>%
+  landscape()
 ```
 
 ```{r organ_specific_characteristics}
@@ -1051,7 +1256,14 @@ mlu <- readRDS("matched_lung.rds") %>%
   mutate(dgn_join_key = as.character(dgn_code)) %>%
   left_join(dgn_maps$Lung %>% rename(dgn_group = group),
             by = c("dgn_join_key" = "dgn_code")) %>%
-  mutate(dgn_group = factor(dgn_group, levels = unique(dgn_maps$Lung$group)))
+  mutate(dgn_group = factor(dgn_group, levels = unique(dgn_maps$Lung$group)),
+         # Initial listing status (CAN_INIT_STAT). Lung runs on LAS/CAS, not
+         # status tiers, so this is an active/inactive flag: 7010/7099 carry an
+         # initial active-status date; 7999 carries an initial inactive-status
+         # date (verified against CAN_INIT_ACT/INACT_STAT_DT).
+         status = factor(if_else(as.character(init_status) == "7999",
+                                 "Inactive", "Active"),
+                         levels = c("Active", "Inactive")))
 
 lung_dgn_pool <- unique(dgn_maps$Lung$group)
 lung_dgn_pool <- lung_dgn_pool[!grepl("Congenital", lung_dgn_pool)]
@@ -1061,6 +1273,14 @@ lung_dgn_labels <- strip_organ_prefix(lung_dgn_levels)
 
 lung_specs <- c(
   matched_common_specs,
+  list(
+    list(row_type = "section", label = "Status at listing, No. (%)",
+         kind = "cat_section", var = "status"),
+    list(row_type = "data", label = "  Active",
+         kind = "cat_level", var = "status", level = "Active"),
+    list(row_type = "data", label = "  Inactive",
+         kind = "cat_level", var = "status", level = "Inactive")
+  ),
   list(list(row_type = "section", label = "Diagnosis, No. (%)",
             kind = "cat_section", var = "dgn_group")),
   lapply(seq_along(lung_dgn_levels), function(i)
@@ -1094,6 +1314,25 @@ mki <- readRDS("matched_kidney.rds") %>%
             by = c("dgn_join_key" = "dgn_code")) %>%
   mutate(dgn_group = factor(dgn_group, levels = unique(dgn_maps$Kidney$group)))
 
+# EPTS (Estimated Post-Transplant Survival) raw score, OPTN formula, from the
+# candidate's age, diabetes, prior solid-organ transplant, and years on dialysis
+# (0 if preemptive). EPTS is not distributed in this SAF; the raw score (the
+# linear predictor) is reported directly -- the OPTN percentile mapping is not
+# applied. Diabetes "Unknown" (n=5) is treated as non-diabetic.
+epts_raw <- function(d) {
+  age <- d$age
+  dm  <- as.integer(d$diabetes == "History of DM")
+  ptx <- as.integer(coalesce(d$prev_solid_tx, 0L) == 1)
+  dy  <- pmax(coalesce(d$dialysis_days, 0), 0) / 365.25
+  dz  <- as.integer(dy == 0)
+  0.047 * pmax(age - 25, 0) - 0.015 * dm * pmax(age - 25, 0) +
+    0.398 * ptx - 0.237 * dm * ptx +
+    0.315 * log(dy + 1) - 0.099 * dm * log(dy + 1) +
+    0.130 * dz - 0.348 * dm * dz +
+    1.262 * dm
+}
+mki$epts <- epts_raw(mki)
+
 kidney_dgn_levels <- order_diag_groups(unique(dgn_maps$Kidney$group),
                                         mki %>% rename(group = dgn_group))
 kidney_dgn_labels <- strip_organ_prefix(kidney_dgn_levels)
@@ -1103,6 +1342,8 @@ kidney_specs <- c(
   list(
     list(row_type = "data",    label = "Years on dialysis at listing, mean (SD)",
          kind = "cont", var = "years_on_dialysis"),
+    list(row_type = "data",    label = "EPTS raw score, mean (SD)",
+         kind = "cont", var = "epts"),
     list(row_type = "section", label = "Diagnosis, No. (%)",
          kind = "cat_section", var = "dgn_group")
   ),
@@ -1121,6 +1362,8 @@ render_matched_table(
         "nearest-neighbor matching as defined in",
         "survival_benefit_kidney_2022.Rmd. 'Years on dialysis at listing'",
         "is restricted to candidates currently on dialysis with",
-        "dialysis_days > 0.")
+        "dialysis_days > 0. EPTS is the OPTN raw score (linear predictor) from",
+        "candidate age, diabetes, prior transplant, and years on dialysis; it",
+        "is not distributed in this SAF release.")
 )
 ```

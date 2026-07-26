@@ -7,7 +7,10 @@ output: html_document
 
 ```{r global_options, include=FALSE}
 library(knitr)
-opts_chunk$set(cache = TRUE, warning = FALSE, message = FALSE,
+# cache.lazy = FALSE: the data_load / first_tx chunks hold multi-GB SAS tables,
+# which knitr's default lazy-load cache cannot serialize ("long vectors not
+# supported yet"). Same workaround the organ files use on supp2y_setup.
+opts_chunk$set(cache = TRUE, cache.lazy = FALSE, warning = FALSE, message = FALSE,
                tidy.opts = list(width.cutoff = 60))
 ```
 
@@ -739,9 +742,9 @@ analytic_list <- list(Heart  = analytic_heart,
                       Lung   = analytic_lung,
                       Kidney = analytic_kidney)
 
-# Collapse multiple listings to one row per person before applying exclusions.
-# SRTR PX_ID is per-registration: a candidate listed for the same organ at more
-# than one center holds several PX_IDs sharing one PERS_ID. Without this, each
+# Collapse multiple listings to one row per person. SRTR PX_ID is
+# per-registration: a candidate listed for the same organ at more than one
+# center holds several PX_IDs sharing one PERS_ID. Without this, each
 # registration is counted as an independent candidate, and -- because a
 # transplant links to only the registration under which it occurred -- a
 # multiply-listed recipient would appear as transplanted=1 on that registration
@@ -756,48 +759,50 @@ dedupe_persons <- function(d) {
     ungroup()
 }
 
+# Exclusion order matches the CONSORT summary_table (dedup-first): collapse
+# duplicate multi-center listings FIRST (one row per person), then exclude
+# multi-organ candidates, then inactive, then data errors. De-duplication
+# happens before the inactive/data-error filters so the "prefer active"
+# tie-break in dedupe_persons is meaningful. The final eligible set (step3) is
+# unchanged by this ordering.
 apply_global <- function(d) {
-  step0 <- d
+  step0  <- d
   step_d <- dedupe_persons(step0)
-  step1 <- step_d %>% filter(is_multi_organ      == 0)
-  step2 <- step1  %>% filter(inactive_throughout == 0)
-  step3 <- step2  %>% filter(data_error          == 0)
+  step1  <- step_d %>% filter(is_multi_organ      == 0)
+  step2  <- step1  %>% filter(inactive_throughout == 0)
+  step3  <- step2  %>% filter(data_error          == 0)
   list(
     step0 = step0, step_d = step_d, step1 = step1, step2 = step2, step3 = step3,
-    n_listed  = nrow(step0),
-    n_persons = n_distinct(step0$PERS_ID),
-    n_dupe    = nrow(step0) - nrow(step_d),
-    n_multi   = nrow(step_d) - nrow(step1),
-    n_inact   = nrow(step1) - nrow(step2),
-    n_derr    = nrow(step2) - nrow(step3),
-    n_after   = nrow(step3)
+    n_listed = nrow(step0),
+    n_dupe   = nrow(step0)  - nrow(step_d),
+    n_multi  = nrow(step_d) - nrow(step1),
+    n_inact  = nrow(step1)  - nrow(step2),
+    n_derr   = nrow(step2)  - nrow(step3),
+    n_after  = nrow(step3)
   )
 }
 global_results <- lapply(analytic_list, apply_global)
 
 cat("Global exclusions (applied to each organ's analytic frame):\n\n")
-totals <- c(listed = 0, persons = 0, dupe = 0, multi = 0, inact = 0, derr = 0, after = 0)
+totals <- c(listed = 0, multi = 0, dupe = 0, inact = 0, derr = 0, after = 0)
 for (org in names(global_results)) {
   g <- global_results[[org]]
   cat(sprintf("  %s\n", org))
   cat(sprintf("    Registrations in Pre or Post window:       %s\n", comma(g$n_listed)))
-  cat(sprintf("      (distinct candidates:                    %s)\n", comma(g$n_persons)))
   cat(sprintf("      - Duplicate multi-center listings:       -%s\n", comma(g$n_dupe)))
   cat(sprintf("      - Multi-organ candidate/recipient:       -%s\n", comma(g$n_multi)))
   cat(sprintf("      - Inactive at listing & never active:    -%s\n", comma(g$n_inact)))
   cat(sprintf("      - Data entry errors:                     -%s\n", comma(g$n_derr)))
   cat(sprintf("    After global exclusions:                   %s\n\n", comma(g$n_after)))
   totals["listed"]  <- totals["listed"]  + g$n_listed
-  totals["persons"] <- totals["persons"] + g$n_persons
-  totals["dupe"]    <- totals["dupe"]    + g$n_dupe
   totals["multi"]   <- totals["multi"]   + g$n_multi
+  totals["dupe"]    <- totals["dupe"]    + g$n_dupe
   totals["inact"]   <- totals["inact"]   + g$n_inact
   totals["derr"]    <- totals["derr"]    + g$n_derr
   totals["after"]   <- totals["after"]   + g$n_after
 }
 cat(sprintf("  TOTAL across organs\n"))
 cat(sprintf("    Registrations in Pre or Post window:       %s\n", comma(totals["listed"])))
-cat(sprintf("      (distinct candidates:                    %s)\n", comma(totals["persons"])))
 cat(sprintf("      - Duplicate multi-center listings:       -%s\n", comma(totals["dupe"])))
 cat(sprintf("      - Multi-organ candidate/recipient:       -%s\n", comma(totals["multi"])))
 cat(sprintf("      - Inactive at listing & never active:    -%s\n", comma(totals["inact"])))
@@ -964,14 +969,22 @@ in_window <- function(d) {
            CAN_AGE_AT_LISTING > 17,
            (CAN_LISTING_DT >= c1_start & CAN_LISTING_DT <= c1_end) |
            (CAN_LISTING_DT >= c2_start & CAN_LISTING_DT <= c2_end)) %>%
-    select(PX_ID)
+    select(PX_ID, PERS_ID, WL_ORG)
 }
-starting_pxids <- bind_rows(
+starting <- bind_rows(
   in_window(cand_thor),
   in_window(cand_liin),
   in_window(cand_kipa)
-) %>% distinct(PX_ID) %>% pull(PX_ID)
-n_start <- length(starting_pxids)
+) %>% distinct(PX_ID, .keep_all = TRUE)
+n_start <- nrow(starting)                        # listings (registrations)
+
+# Duplicate multi-center listings are collapsed FIRST -- before the candidate
+# total and every other exclusion criterion. A candidate listed for the same
+# organ (WL_ORG) at more than one center holds multiple PX_IDs under one
+# PERS_ID; the total number of candidates is the count of unique (person, organ)
+# candidacies, and the duplicates removed are the surplus listings.
+n_candidates <- starting %>% distinct(PERS_ID, WL_ORG) %>% nrow()
+n_excl_dupe  <- n_start - n_candidates
 
 # Build the combined frame of "passed multi-organ filter" candidates. This is
 # the union of the four per-organ analytic frames, after dropping
@@ -988,11 +1001,17 @@ combined_analytic <- bind_rows(
   filter(is_multi_organ == 0,
          (in_cohort_1 | in_cohort_2))
 
-# Step 1: Multi-organ exclusion total = starting N - candidates remaining
-# after the multi-organ filter. This captures all three sub-categories:
-# (a) multi-organ WL_ORG (HL, KP), (b) cross-table multi-listed candidates,
-# and (c) multi-organ transplant recipients (REC_TX_TY 2/3/4).
-n_excl_multi_total <- n_start - nrow(combined_analytic)
+# Collapse multi-center duplicate listings to one row per person (same rule as
+# apply_global: prefer the transplanted registration, then an active listing,
+# then the earliest). The duplicate COUNT was taken above at the listing level,
+# before any other exclusion; this de-duplicates the analytic frame so the
+# downstream multi-organ / eligible counts reconcile with cohort_out.
+combined_analytic <- dedupe_persons(combined_analytic)
+
+# Multiple-organ exclusion = total candidates minus those remaining after the
+# multi-organ filter. Captures (a) multi-organ WL_ORG (HL, KP), (b) cross-table
+# multi-listed candidates, and (c) multi-organ transplant recipients (REC_TX_TY).
+n_excl_multi_total <- n_candidates - nrow(combined_analytic)
 
 # Per-(organ, period) low-volume center lookup. A given candidate's organ-period
 # determines whether their listing center is low-volume.
@@ -1109,7 +1128,7 @@ per_organ_eligible_post <- vapply(organ_order, function(o) cell_n(cohort_out,  o
 per_organ_matched_pre   <- vapply(organ_order, function(o) cell_n(matched_out, o, "Pre"),  integer(1))
 per_organ_matched_post  <- vapply(organ_order, function(o) cell_n(matched_out, o, "Post"), integer(1))
 
-n_excl_total <- n_excl_multi_total + n_excl_low + n_excl_inact + n_excl_data
+n_excl_total <- n_excl_multi_total + n_excl_dupe + n_excl_low + n_excl_inact + n_excl_data
 stopifnot(n_excl_total == n_start - n_eligible)
 
 # Eligible-cohort demographics (mean age + % female)
@@ -1134,7 +1153,9 @@ fmt_n_pct <- function(n, total) sprintf("%s (%.1f%%)", comma(n),
 # Assemble the table
 summary_rows <- tibble(
   ` ` = c(
-    "Adult candidates listed Aug 2019-Jul 2021 or Aug 2022-Jul 2024",
+    "Adult listings (registrations) Aug 2019-Jul 2021 or Aug 2022-Jul 2024",
+    "  Excluded: Duplicate multi-center listing",
+    "Total candidates (unique person-organ)",
     "  Excluded: Multiple organ transplant",
     "  Excluded: Low-volume transplant center",
     "  Excluded: Never activated on waiting list",
@@ -1184,6 +1205,8 @@ summary_rows <- tibble(
   ),
   N = c(
     fmt_int(n_start),
+    fmt_int(n_excl_dupe),
+    fmt_int(n_candidates),
     fmt_int(n_excl_multi_total),
     fmt_int(n_excl_low),
     fmt_int(n_excl_inact),

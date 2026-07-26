@@ -226,7 +226,8 @@ ggplot(agg_forest, aes(x = organ, y = est, fill = cohort,
 ```{r aggregate_bar_years, dependson="aggregate_bar", fig.width=7, fig.height=4}
 # Aggregate survival benefit in life-years (days / 365.25).
 agg_forest_years <- agg_forest %>%
-  mutate(est = est / 365.25, lo = lo / 365.25, hi = hi / 365.25)
+  mutate(est = est / 365.25, lo = lo / 365.25, hi = hi / 365.25,
+         organ = factor(organ, levels = c("Heart", "Lung", "Liver", "Kidney")))
 
 ggplot(agg_forest_years, aes(x = organ, y = est, fill = cohort,
                               group = interaction(organ, cohort))) +
